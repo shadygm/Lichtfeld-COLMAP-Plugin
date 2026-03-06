@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+uv.lock
+pyrightconfig.json
+.vscode/
+settings.json

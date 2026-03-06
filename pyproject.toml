@@ -1,0 +1,12 @@
+[project]
+name = "Lichtfeld-COLMAP-Plugin"
+version = "0.1.0"
+description = "COLMAP reconstruction (pycolmap) and import workflow for LichtFeld Studio"
+requires-python = ">=3.10"
+
+dependencies = [
+  "pycolmap",
+]
+
+[tool.lichtfeld]
+hot_reload = true
