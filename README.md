@@ -48,14 +48,18 @@ git clone https://github.com/shadygm/Lichtfeld-COLMAP-Plugin.git ~/.lichtfeld/pl
 
 ## Output
 
-The plugin writes a sparse COLMAP workspace next to the selected image folder:
+The plugin writes a standard COLMAP-style dataset layout. If you select an existing `images/` folder, the dataset root is its parent directory. Otherwise, the plugin creates a sibling dataset folder named after the selected image folder:
 
 ```text
-<images_folder>/<folder_name>_reconstruction/
+<dataset_root>/
+├── images/
+└── sparse/
 ```
 
-The final sparse model is saved here:
+The final sparse model is saved directly here:
 
 ```text
-<images_folder>/<folder_name>_reconstruction/sparse/0
+<dataset_root>/sparse/
 ```
+
+After a successful reconstruction, the plugin also loads `<dataset_root>/` into LichtFeld as a normal dataset.

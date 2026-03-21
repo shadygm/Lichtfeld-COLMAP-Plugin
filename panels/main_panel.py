@@ -5,6 +5,7 @@ import ctypes
 import gc
 import math
 import os
+import shutil
 import threading
 import time
 from collections import deque
@@ -103,6 +104,8 @@ PRESET_NORMAL_PARAMS = dict(
     ba_global_max_num_iterations=50,
 )
 
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+
 
 def _try_set_attr(obj, attr: str, value) -> bool:
     """Best-effort set for pybind option objects (older pycolmap builds may lack some fields)."""
@@ -122,6 +125,53 @@ def _trim_process_memory() -> None:
             malloc_trim(0)
     except Exception:
         pass
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(os.fspath(left))) == os.path.normcase(os.path.abspath(os.fspath(right)))
+
+
+def _reset_directory(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _link_or_copy_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        target.unlink()
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def _stage_flat_directory(
+    source_dir: Path,
+    target_dir: Path,
+    *,
+    allowed_extensions: Optional[tuple[str, ...]] = None,
+) -> int:
+    if _same_path(source_dir, target_dir):
+        return sum(
+            1
+            for entry in source_dir.iterdir()
+            if entry.is_file() and (allowed_extensions is None or entry.suffix.lower() in allowed_extensions)
+        )
+
+    _reset_directory(target_dir)
+
+    staged_count = 0
+    for entry in sorted(source_dir.iterdir(), key=lambda path: path.name.lower()):
+        if not entry.is_file():
+            continue
+        if allowed_extensions is not None and entry.suffix.lower() not in allowed_extensions:
+            continue
+        _link_or_copy_file(entry, target_dir / entry.name)
+        staged_count += 1
+
+    return staged_count
 
 
 @dataclass
@@ -147,6 +197,7 @@ class ColmapParams:
 class ReconResult:
     success: bool
     recon_dir: Optional[str] = None
+    dataset_dir: Optional[str] = None
     elapsed_s: float = 0.0
     error: Optional[str] = None
     metrics: Optional["ReconMetrics"] = None
@@ -352,7 +403,7 @@ class ColmapReconJob:
 
             image_files = [
                 f for f in os.listdir(images_dir)
-                if f.lower().endswith((".jpg", ".jpeg", ".png", ".JPG", ".PNG"))
+                if f.lower().endswith(IMAGE_EXTENSIONS)
             ]
 
             info(f"[COLMAP] Found {len(image_files)} images")
@@ -385,12 +436,15 @@ class ColmapReconJob:
             # Setup folders
             # ------------------------------------------------
 
-            dataset_name = os.path.basename(os.path.normpath(images_dir))
+            images_path = Path(images_dir)
+            if images_path.name.lower() == "images":
+                recon_root_path = images_path.parent
+                dataset_images_path = images_path
+            else:
+                recon_root_path = images_path.parent / f"{images_path.name}_reconstruction"
+                dataset_images_path = recon_root_path / "images"
 
-            recon_root = os.path.join(
-                images_dir,
-                f"{dataset_name}_reconstruction"
-            )
+            recon_root = os.fspath(recon_root_path)
             os.makedirs(recon_root, exist_ok=True)
 
             # Validate recon_root is writable and disk has space
@@ -414,7 +468,6 @@ class ColmapReconJob:
 
             # Check available disk space (warn if < 500 MB)
             try:
-                import shutil
                 stat = shutil.disk_usage(recon_root)
                 free_gb = stat.free / (1024 ** 3)
                 if free_gb < 0.5:
@@ -422,7 +475,33 @@ class ColmapReconJob:
             except Exception:
                 pass  # Non-fatal if we can't check disk space
 
-            database_path = os.path.join(recon_root, "database.db")
+            masks_source_path = images_path.parent / "masks"
+            dataset_masks_path = recon_root_path / "masks"
+            sparse_root_path = recon_root_path / "sparse"
+            work_root_path = recon_root_path / ".colmap"
+            mapping_root_path = work_root_path / "mapping"
+
+            staged_image_count = _stage_flat_directory(
+                images_path,
+                dataset_images_path,
+                allowed_extensions=IMAGE_EXTENSIONS,
+            )
+
+            if masks_source_path.is_dir():
+                _stage_flat_directory(masks_source_path, dataset_masks_path)
+                info(f"[COLMAP] Masks directory ready: {dataset_masks_path}")
+            elif dataset_masks_path.exists() and not _same_path(masks_source_path, dataset_masks_path):
+                shutil.rmtree(dataset_masks_path)
+
+            _reset_directory(sparse_root_path)
+            _reset_directory(work_root_path)
+            mapping_root_path.mkdir(parents=True, exist_ok=True)
+
+            info(f"[COLMAP] Dataset root: {recon_root_path}")
+            info(f"[COLMAP] Images directory: {dataset_images_path}")
+            info(f"[COLMAP] Prepared {staged_image_count} images for reconstruction")
+
+            database_path = os.fspath(work_root_path / "database.db")
 
             # Clean up any corrupted database from previous failed runs, including WAL and SHM files
             for db_file in [database_path, f"{database_path}-wal", f"{database_path}-shm"]:
@@ -439,10 +518,10 @@ class ColmapReconJob:
                                 "The file may be in use or you may lack permissions."
                             )
 
-            sparse_root = os.path.join(recon_root, "sparse")
-            os.makedirs(sparse_root, exist_ok=True)
+            sparse_root = os.fspath(sparse_root_path)
+            mapping_root = os.fspath(mapping_root_path)
 
-            info(f"[COLMAP] Sparse reconstruction directory: {recon_root}")
+            info(f"[COLMAP] Sparse reconstruction directory: {sparse_root_path}")
 
             # ================================================
             # FEATURE EXTRACTION
@@ -488,7 +567,7 @@ class ColmapReconJob:
             # Build extract_kwargs based on available API
             extract_kwargs = dict(
                 database_path=database_path,
-                image_path=images_dir,
+                image_path=os.fspath(dataset_images_path),
                 camera_mode=camera_mode,
             )
 
@@ -731,8 +810,8 @@ class ColmapReconJob:
                     _try_set_attr(global_opts, "mapper", mapper_opts)
                 reconstructions = pycolmap.global_mapping(
                     database_path=database_path,
-                    image_path=images_dir,
-                    output_path=sparse_root,
+                    image_path=os.fspath(dataset_images_path),
+                    output_path=mapping_root,
                     options=global_opts,
                 )
             else:
@@ -745,8 +824,8 @@ class ColmapReconJob:
 
                 reconstructions = pycolmap.incremental_mapping(
                     database_path=database_path,
-                    image_path=images_dir,
-                    output_path=sparse_root,
+                    image_path=os.fspath(dataset_images_path),
+                    output_path=mapping_root,
                     options=pipeline_opts,
                 )
 
@@ -782,13 +861,24 @@ class ColmapReconJob:
             if num_images == 0:
                 raise RuntimeError("COLMAP failed: 0 registered images")
 
-            sparse_model_dir = os.path.join(sparse_root, "0")
-            os.makedirs(sparse_model_dir, exist_ok=True)
+            if hasattr(reconstruction, "write_text"):
+                reconstruction.write_text(sparse_root)
+                info(f"[COLMAP] Sparse model saved to {sparse_root} (text format)")
+            else:
+                reconstruction.write(sparse_root)
+                info(f"[COLMAP] Sparse model saved to {sparse_root}")
 
-            reconstruction.write(sparse_model_dir)
+            export_ply = getattr(reconstruction, "export_PLY", None)
+            if callable(export_ply):
+                points_ply_path = os.path.join(sparse_root, "points3D.ply")
+                try:
+                    export_ply(points_ply_path)
+                    info(f"[COLMAP] Sparse point cloud exported to {points_ply_path}")
+                except Exception as exc:
+                    warn(f"[COLMAP] Could not export PLY: {exc}")
 
             self._update(ReconStage.MAPPING, 90.0, "Saving sparse model")
-            info(f"[COLMAP] Sparse model saved to {sparse_model_dir}")
+            shutil.rmtree(work_root_path, ignore_errors=True)
 
             # Drop the large in-memory reconstruction after saving to reduce peak RAM.
             del reconstruction
@@ -803,7 +893,8 @@ class ColmapReconJob:
 
             result = ReconResult(
                 success=True,
-                recon_dir=sparse_model_dir,
+                recon_dir=sparse_root,
+                dataset_dir=recon_root,
                 elapsed_s=elapsed,
                 metrics=recon_metrics,
             )
@@ -867,6 +958,7 @@ class MainPanel(lf.ui.Panel):
         self._last_status = ""
         self._last_progress = -1.0
         self._last_result_key = None
+        self._last_loaded_result_key = None
         self._last_log_text = ""
         self._collapsed = {"instructions", "advanced"}
 
@@ -939,9 +1031,7 @@ class MainPanel(lf.ui.Panel):
         )
         model.bind_func(
             "result_path",
-            lambda: self._last_result.recon_dir or ""
-            if self._last_result and self._last_result.success
-            else "",
+            self._result_dataset_path,
         )
         model.bind_func(
             "result_time",
@@ -980,6 +1070,9 @@ class MainPanel(lf.ui.Panel):
         if job_result_key is not None and job_result_key != self._last_result_key:
             self._last_result = job_result
             self._last_result_key = job_result_key
+            if job_result and job_result.success and job_result_key != self._last_loaded_result_key:
+                self._load_dataset_result(job_result)
+                self._last_loaded_result_key = job_result_key
             self._dirty(
                 "show_results",
                 "result_path",
@@ -1087,6 +1180,7 @@ class MainPanel(lf.ui.Panel):
         return (
             result.success,
             result.recon_dir,
+            result.dataset_dir,
             result.elapsed_s,
             result.error,
             None
@@ -1132,6 +1226,21 @@ class MainPanel(lf.ui.Panel):
         if not self._last_result or not self._last_result.success:
             return None
         return self._last_result.metrics
+
+    def _result_dataset_path(self) -> str:
+        if not self._last_result or not self._last_result.success:
+            return ""
+        return self._last_result.dataset_dir or self._last_result.recon_dir or ""
+
+    def _load_dataset_result(self, result: ReconResult) -> None:
+        dataset_dir = result.dataset_dir or ""
+        if not dataset_dir:
+            return
+        try:
+            lf.log.info(f"[COLMAP] Loading dataset: {dataset_dir}")
+            lf.load_file(dataset_dir, is_dataset=True)
+        except Exception as exc:
+            lf.log.error(f"[COLMAP] Failed to load dataset {dataset_dir}: {exc}")
 
     def _result_sparse_points(self) -> str:
         metrics = self._result_metrics()
@@ -1355,6 +1464,7 @@ class MainPanel(lf.ui.Panel):
 
         self._last_result = None
         self._last_result_key = None
+        self._last_loaded_result_key = None
         self._last_log_text = ""
 
         # Snapshot params so UI edits during a run don't affect the active reconstruction.
