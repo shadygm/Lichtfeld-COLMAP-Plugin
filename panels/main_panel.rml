@@ -1,0 +1,155 @@
+<rml>
+<body data-model="colmap">
+<div id="content-wrap">
+<div id="content">
+
+  <span class="panel-title text-accent">COLMAP Reconstruction</span>
+  <span class="panel-subtitle text-muted">Build a sparse reconstruction from an image folder using COLMAP.</span>
+
+  <div class="separator"></div>
+
+  <div class="section-card">
+    <div class="section-header" id="hdr-instructions" data-event-click="toggle_section('instructions')">
+      <span class="section-arrow" id="arrow-instructions">&#x25B6;</span>
+      <span>Instructions</span>
+    </div>
+    <div class="section-content collapsed" id="sec-instructions">
+      <span class="help-text text-muted">1. Select a folder containing overlapping JPG or PNG images.</span>
+      <span class="help-text text-muted">2. Choose Low or Normal to start quickly, or open Advanced if you need manual tuning.</span>
+      <span class="help-text text-muted">3. Run reconstruction and let the plugin import the generated dataset.</span>
+    </div>
+  </div>
+
+  <div class="section-card">
+    <div class="section-header" id="hdr-setup" data-event-click="toggle_section('setup')">
+      <span class="section-arrow" id="arrow-setup">&#x25B6;</span>
+      <span>Setup</span>
+    </div>
+    <div class="section-content" id="sec-setup">
+      <span class="help-text text-muted" data-if="!has_images_dir">No image folder selected yet.</span>
+      <span class="path-preview text-default" data-if="has_images_dir">{{images_dir_text}}</span>
+
+      <div class="setting-row">
+        <span class="prop-label">Images Folder</span>
+        <input type="text" data-value="images_dir" />
+      </div>
+      <button class="btn btn--default btn--full" data-event-click="browse_images">Browse Folder</button>
+
+      <div class="setting-row preset-row" data-attr-title="preset_description">
+        <span class="prop-label">Preset</span>
+        <select data-value="preset">
+          <option value="Low">Low</option>
+          <option value="Normal">Normal</option>
+          <option value="Custom">Custom</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <label class="setting-label">
+          <input type="checkbox" data-checked="auto_import" />
+          <span>Auto-import into scene when finished</span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-card">
+    <div class="section-header" id="hdr-advanced" data-event-click="toggle_section('advanced')">
+      <span class="section-arrow" id="arrow-advanced">&#x25B6;</span>
+      <span>Advanced</span>
+    </div>
+    <div class="section-content collapsed" id="sec-advanced">
+      <span class="help-text text-muted">Tune matching and mapping only when the presets are not enough. Editing any option here switches the preset to Custom.</span>
+
+      <div class="setting-row">
+        <span class="prop-label">Camera Model</span>
+        <select data-value="camera_model">
+          <option value="OPENCV">OPENCV</option>
+          <option value="PINHOLE">PINHOLE</option>
+          <option value="SIMPLE_RADIAL">SIMPLE_RADIAL</option>
+          <option value="SIMPLE_PINHOLE">SIMPLE_PINHOLE</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <span class="prop-label">Matcher</span>
+        <select data-value="matcher">
+          <option value="exhaustive">Exhaustive</option>
+          <option value="sequential">Sequential</option>
+          <option value="vocab_tree">Vocab Tree</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <span class="prop-label" title="Vocab tree is the preferred low-memory option. If this pycolmap build cannot use it, the job falls back to sequential matching.">Matcher</span>
+      </div>
+
+      <div class="setting-row">
+        <span class="prop-label">SIFT Max Image Size</span>
+        <input type="range" class="setting-slider" data-value="sift_max_image_size" min="800" max="2400" step="100" />
+        <span class="slider-value">{{sift_max_image_size}}</span>
+      </div>
+
+      <div class="setting-row">
+        <span class="prop-label">SIFT Max Features</span>
+        <input type="range" class="setting-slider" data-value="sift_max_num_features" min="1024" max="4096" step="256" />
+        <span class="slider-value">{{sift_max_num_features}}</span>
+      </div>
+
+      <div class="setting-row">
+        <span class="prop-label">SIFT Max Matches</span>
+        <input type="range" class="setting-slider" data-value="sift_max_num_matches" min="1024" max="4096" step="256" />
+        <span class="slider-value">{{sift_max_num_matches}}</span>
+      </div>
+
+      <div class="setting-row" data-if="show_exhaustive_block_size">
+        <span class="prop-label">Exhaustive Block Size</span>
+        <input type="range" class="setting-slider" data-value="exhaustive_block_size" min="5" max="50" step="1" />
+        <span class="slider-value">{{exhaustive_block_size}}</span>
+      </div>
+
+      <div class="setting-row">
+        <span class="prop-label">BA Max Iterations</span>
+        <input type="range" class="setting-slider" data-value="ba_global_max_num_iterations" min="10" max="100" step="5" />
+        <span class="slider-value">{{ba_global_max_num_iterations}}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-card" data-if="show_config_warning">
+    <span class="status-warning">{{warning_text}}</span>
+  </div>
+
+  <div class="separator"></div>
+
+  <div data-if="show_idle">
+    <button class="btn btn--success btn--full action-btn" data-event-click="do_start">Run Reconstruction</button>
+  </div>
+
+  <div data-if="show_running">
+    <span class="status-line text-default">Stage: {{stage_text}}</span>
+    <div class="progress-wrap">
+      <progress class="job-progress" max="1" data-attr-value="progress_value"></progress>
+      <span class="progress-text">{{progress_pct}}</span>
+    </div>
+    <span class="help-text text-muted">{{progress_status}}</span>
+    <button class="btn btn--warning btn--full action-btn" data-event-click="do_cancel">Cancel</button>
+  </div>
+
+  <div data-if="show_results">
+    <div class="separator"></div>
+    <span class="section-title text-accent">Result</span>
+    <span class="result-line text-default">Output: {{result_path}}</span>
+    <span class="result-line text-default">Elapsed: {{result_time}}</span>
+    <button class="btn btn--default btn--full action-btn" data-if="can_manual_import" data-event-click="do_import">Import Dataset</button>
+  </div>
+
+  <div data-if="show_error">
+    <div class="separator"></div>
+    <span class="status-error">Error</span>
+    <span class="error-detail text-default">{{error_text}}</span>
+  </div>
+
+</div>
+</div>
+</body>
+</rml>
