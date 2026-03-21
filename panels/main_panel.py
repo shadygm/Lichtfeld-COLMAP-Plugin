@@ -3,28 +3,24 @@ from __future__ import annotations
 
 import ctypes
 import gc
-import glob
+import math
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-import onnxruntime
-
-onnx_dir = os.path.join(os.path.dirname(onnxruntime.__file__), "capi")
-
-libs = glob.glob(os.path.join(onnx_dir, "libonnxruntime.so*"))
-if not libs:
-    raise RuntimeError(f"ONNXRuntime library not found in {onnx_dir}")
-
-ctypes.CDLL(libs[0], mode=ctypes.RTLD_GLOBAL)
-
 import lichtfeld as lf
 import pycolmap
 from pycolmap import CameraMode
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 try:
     from lfs_plugins import ScrubFieldController, ScrubFieldSpec
@@ -38,8 +34,6 @@ class ReconStage(Enum):
     FEATURE_EXTRACTION = "feature_extraction"
     MATCHING = "matching"
     MAPPING = "mapping"
-    UNDISTORTING = "undistorting"
-    IMPORTING = "importing"
     DONE = "done"
     ERROR = "error"
     CANCELLED = "cancelled"
@@ -87,8 +81,10 @@ PRESET_LOW_PARAMS = dict(
     camera_model="OPENCV",
     single_camera=True,
     sift_max_image_size=1200,
-    sift_max_num_features=1024,
+    sift_max_num_features=1536,
     matcher="sequential",
+    reconstruction_mode="incremental",
+    use_view_graph_calibration=False,
     sift_max_num_matches=1024,
     exhaustive_block_size=10,
     ba_global_max_num_iterations=20,
@@ -99,7 +95,9 @@ PRESET_NORMAL_PARAMS = dict(
     single_camera=True,
     sift_max_image_size=1600,
     sift_max_num_features=2048,
-    matcher="vocab_tree",
+    matcher="exhaustive",
+    reconstruction_mode="incremental",
+    use_view_graph_calibration=False,
     sift_max_num_matches=2048,
     exhaustive_block_size=15,
     ba_global_max_num_iterations=50,
@@ -135,15 +133,14 @@ class ColmapParams:
     sift_max_num_features: int = 2048
 
     # Matching
-    matcher: str = "vocab_tree"  # exhaustive | sequential | vocab_tree
+    matcher: str = "exhaustive"  # exhaustive | sequential | vocab_tree
+    reconstruction_mode: str = "incremental"  # incremental | global
+    use_view_graph_calibration: bool = False
     sift_max_num_matches: int = 2048
     exhaustive_block_size: int = 15
 
     # Mapping
     ba_global_max_num_iterations: int = 50
-
-    # Undistortion / export
-    undistort_output_type: str = "COLMAP"  # COLMAP (writes images/ + sparse/)
 
 
 @dataclass
@@ -152,6 +149,89 @@ class ReconResult:
     recon_dir: Optional[str] = None
     elapsed_s: float = 0.0
     error: Optional[str] = None
+    metrics: Optional["ReconMetrics"] = None
+
+
+@dataclass(frozen=True)
+class ReconMetrics:
+    total_points: int = 0
+    mean_reprojection_error_px: float = -1.0
+    median_reprojection_error_px: float = -1.0
+    p90_reprojection_error_px: float = -1.0
+    good_ratio: float = -1.0
+
+
+def _median_sorted(values: list[float]) -> float:
+    count = len(values)
+    if count == 0:
+        return -1.0
+    mid = count // 2
+    if count % 2 == 1:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2.0
+
+
+def _percentile_sorted(values: list[float], percentile: float) -> float:
+    if not values:
+        return -1.0
+    if percentile <= 0.0:
+        return values[0]
+    if percentile >= 100.0:
+        return values[-1]
+
+    position = (len(values) - 1) * (percentile / 100.0)
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    lower_value = values[lower_index]
+    upper_value = values[upper_index]
+    if lower_index == upper_index:
+        return lower_value
+    fraction = position - lower_index
+    return lower_value + (upper_value - lower_value) * fraction
+
+
+def _compute_recon_metrics(reconstruction) -> ReconMetrics:
+    total_points = len(reconstruction.points3D)
+    if total_points == 0:
+        return ReconMetrics()
+
+    errors: list[float] = []
+    for point in reconstruction.points3D.values():
+        try:
+            error = float(point.error)
+        except Exception:
+            continue
+        if math.isfinite(error):
+            errors.append(error)
+
+    if not errors:
+        return ReconMetrics(total_points=total_points)
+
+    if np is not None:
+        error_array = np.asarray(errors, dtype=float)
+        mean_error = float(error_array.mean())
+        median_error = float(np.median(error_array))
+        p90_error = float(np.percentile(error_array, 90))
+    else:
+        sorted_errors = sorted(errors)
+        mean_error = float(sum(sorted_errors) / len(sorted_errors))
+        median_error = float(_median_sorted(sorted_errors))
+        p90_error = float(_percentile_sorted(sorted_errors, 90.0))
+
+    good_ratio = float(sum(error < 2.0 for error in errors) / total_points)
+    return ReconMetrics(
+        total_points=total_points,
+        mean_reprojection_error_px=mean_error,
+        median_reprojection_error_px=median_error,
+        p90_reprojection_error_px=p90_error,
+        good_ratio=good_ratio,
+    )
+
+
+def _format_metric_px(value: float) -> str:
+    if value < 0.0:
+        return "N/A"
+    return f"{value:.4f} px"
 
 
 class ColmapReconJob:
@@ -171,6 +251,7 @@ class ColmapReconJob:
         self._lock = threading.Lock()
         self._cancelled = False
         self._thread: Optional[threading.Thread] = None
+        self._log_lines: deque[str] = deque(maxlen=16)
 
     @property
     def stage(self) -> ReconStage:
@@ -192,14 +273,17 @@ class ColmapReconJob:
         with self._lock:
             return self._result
 
+    @property
+    def log_text(self) -> str:
+        with self._lock:
+            return "\n".join(self._log_lines)
+
     def is_running(self) -> bool:
         return self.stage in (
             ReconStage.CHECKING,
             ReconStage.FEATURE_EXTRACTION,
             ReconStage.MATCHING,
             ReconStage.MAPPING,
-            ReconStage.UNDISTORTING,
-            ReconStage.IMPORTING,
         )
 
     def cancel(self):
@@ -223,12 +307,36 @@ class ColmapReconJob:
         with self._lock:
             return self._cancelled
 
+    def _append_log(self, message: str) -> None:
+        line = str(message).strip()
+        if not line:
+            return
+        if line.startswith("[COLMAP] "):
+            line = line[len("[COLMAP] ") :]
+        with self._lock:
+            self._log_lines.append(line)
+
+    def _log_info(self, message: str) -> None:
+        lf.log.info(message)
+        self._append_log(message)
+
+    def _log_warn(self, message: str) -> None:
+        lf.log.warn(message)
+        self._append_log(message)
+
+    def _log_error(self, message: str) -> None:
+        lf.log.error(message)
+        self._append_log(message)
+
     def _ensure_not_cancelled(self):
         if self._check_cancelled():
             raise RuntimeError("Cancelled")
 
     def _run(self):
         t0 = time.time()
+        info = self._log_info
+        warn = self._log_warn
+        error = self._log_error
 
         try:
             self._update(ReconStage.CHECKING, 2.0, "Checking inputs")
@@ -247,7 +355,7 @@ class ColmapReconJob:
                 if f.lower().endswith((".jpg", ".jpeg", ".png", ".JPG", ".PNG"))
             ]
 
-            lf.log.info(f"[COLMAP] Found {len(image_files)} images")
+            info(f"[COLMAP] Found {len(image_files)} images")
 
             if len(image_files) < 2:
                 raise RuntimeError("Need at least 2 images")
@@ -258,11 +366,13 @@ class ColmapReconJob:
             exhaustive_block_size = max(5, int(self.params.exhaustive_block_size))
             ba_global_max_num_iterations = max(1, int(self.params.ba_global_max_num_iterations))
             matcher_name = self.params.matcher
+            reconstruction_mode = self.params.reconstruction_mode
             num_threads = min(8, os.cpu_count() or 4)
 
-            lf.log.info(
+            info(
                 "[COLMAP] Reconstruction settings: "
                 f"matcher={matcher_name}, "
+                f"reconstruction_mode={reconstruction_mode}, "
                 f"cpu_threads={num_threads}, "
                 f"sift_max_image_size={sift_max_image_size}, "
                 f"sift_max_num_features={sift_max_num_features}, "
@@ -308,7 +418,7 @@ class ColmapReconJob:
                 stat = shutil.disk_usage(recon_root)
                 free_gb = stat.free / (1024 ** 3)
                 if free_gb < 0.5:
-                    lf.log.warn(f"[COLMAP] Low disk space: only {free_gb:.2f} GiB available")
+                    warn(f"[COLMAP] Low disk space: only {free_gb:.2f} GiB available")
             except Exception:
                 pass  # Non-fatal if we can't check disk space
 
@@ -320,9 +430,9 @@ class ColmapReconJob:
                     try:
                         os.remove(db_file)
                         if db_file == database_path:
-                            lf.log.info(f"[COLMAP] Removed existing database file: {database_path}")
+                            info(f"[COLMAP] Removed existing database file: {database_path}")
                     except OSError as e:
-                        lf.log.warn(f"[COLMAP] Could not remove {db_file}: {e}")
+                        warn(f"[COLMAP] Could not remove {db_file}: {e}")
                         if db_file == database_path:
                             raise RuntimeError(
                                 f"Cannot remove old database file {database_path}: {e}. "
@@ -332,11 +442,7 @@ class ColmapReconJob:
             sparse_root = os.path.join(recon_root, "sparse")
             os.makedirs(sparse_root, exist_ok=True)
 
-            undistorted_dir = os.path.join(recon_root, "dense")
-
-            lf.log.info(f"[COLMAP] Reconstruction directory: {recon_root}")
-
-            lf.log.info(f"[COLMAP] Using database path: {database_path}")
+            info(f"[COLMAP] Sparse reconstruction directory: {recon_root}")
 
             # ================================================
             # FEATURE EXTRACTION
@@ -345,7 +451,7 @@ class ColmapReconJob:
             self._ensure_not_cancelled()
             self._update(ReconStage.FEATURE_EXTRACTION, 10.0, "Extracting features")
 
-            lf.log.info("[COLMAP] Starting feature extraction")
+            info("[COLMAP] Extracting features")
 
             camera_mode = CameraMode.SINGLE if self.params.single_camera else CameraMode.AUTO
 
@@ -374,7 +480,7 @@ class ColmapReconJob:
                 _try_set_attr(extraction_opts, "max_image_size", sift_max_image_size)
                 _try_set_attr(extraction_opts, "max_num_features", sift_max_num_features)
 
-            lf.log.info(
+            info(
                 "[COLMAP] Feature extraction compute mode: "
                 + ("GPU requested" if extraction_gpu_requested else "CPU only")
             )
@@ -413,7 +519,7 @@ class ColmapReconJob:
                                 return
                             except TypeError:
                                 continue
-                    lf.log.error(f"[COLMAP] extract_features() failed with error: {e}")
+                    error(f"[COLMAP] extract_features() failed with error: {e}")
                     raise
 
             try:
@@ -421,7 +527,7 @@ class ColmapReconJob:
                 extraction_gpu_used = extraction_gpu_requested
             except Exception as exc:
                 if extraction_gpu_requested and extraction_opts is not None and _try_set_attr(extraction_opts, "use_gpu", False):
-                    lf.log.warn(
+                    warn(
                         "[COLMAP] GPU feature extraction failed "
                         f"({exc}); retrying on CPU."
                     )
@@ -430,7 +536,7 @@ class ColmapReconJob:
                 else:
                     raise
 
-            lf.log.info(
+            info(
                 "[COLMAP] Feature extraction finished "
                 f"using {'GPU' if extraction_gpu_used else 'CPU'}"
             )
@@ -446,7 +552,7 @@ class ColmapReconJob:
             self._ensure_not_cancelled()
             self._update(ReconStage.MATCHING, 30.0, "Matching images")
 
-            lf.log.info("[COLMAP] Starting matching")
+            info("[COLMAP] Matching images")
 
             sift_matching_opts = None
             matching_gpu_requested = False
@@ -457,7 +563,7 @@ class ColmapReconJob:
                 _try_set_attr(sift_matching_opts, "num_threads", num_threads)
                 _try_set_attr(sift_matching_opts, "max_num_matches", sift_max_num_matches)
 
-            lf.log.info(
+            info(
                 "[COLMAP] Matching compute mode: "
                 + ("GPU requested" if matching_gpu_requested else "CPU only")
             )
@@ -493,7 +599,7 @@ class ColmapReconJob:
                         and sift_matching_opts is not None
                         and _try_set_attr(sift_matching_opts, "use_gpu", False)
                     ):
-                        lf.log.warn(
+                        warn(
                             f"[COLMAP] GPU matching failed in {fn_name} "
                             f"({exc}); retrying on CPU."
                         )
@@ -521,13 +627,13 @@ class ColmapReconJob:
                         ):
                             raise RuntimeError("pycolmap.match_vocab_tree is unavailable")
                     except Exception as exc:
-                        lf.log.warn(
+                        warn(
                             "[COLMAP] Vocab tree matching unavailable or failed "
                             f"({exc}); falling back to sequential matching."
                         )
                         matcher_name = "sequential"
                 else:
-                    lf.log.warn(
+                    warn(
                         "[COLMAP] pycolmap.match_vocab_tree is unavailable; "
                         "falling back to sequential matching."
                     )
@@ -560,7 +666,7 @@ class ColmapReconJob:
                 ):
                     raise RuntimeError("pycolmap.match_exhaustive is unavailable")
 
-            lf.log.info(
+            info(
                 "[COLMAP] Matching finished "
                 f"using {'GPU' if matching_gpu_used else 'CPU'}"
             )
@@ -574,21 +680,75 @@ class ColmapReconJob:
             self._ensure_not_cancelled()
             self._update(ReconStage.MAPPING, 60.0, "Running SfM mapping")
 
-            lf.log.info("[COLMAP] Starting incremental mapping")
+            has_global_mapping = hasattr(pycolmap, "global_mapping")
+            has_global_pipeline_options = hasattr(pycolmap, "GlobalPipelineOptions")
+            has_global_mapper_options = hasattr(pycolmap, "GlobalMapperOptions")
+            has_calibrate_view_graph = hasattr(pycolmap, "calibrate_view_graph")
+            has_view_graph_calibration_options = hasattr(pycolmap, "ViewGraphCalibrationOptions")
+            info(f"[COLMAP] Running {reconstruction_mode} mapping")
 
-            pipeline_opts = pycolmap.IncrementalPipelineOptions()
-            _try_set_attr(pipeline_opts, "ba_global_max_num_iterations", ba_global_max_num_iterations)
-            if hasattr(pipeline_opts, "multiple_models"):
-                _try_set_attr(pipeline_opts, "multiple_models", False)
-            if hasattr(pipeline_opts, "max_num_models"):
-                _try_set_attr(pipeline_opts, "max_num_models", 1)
+            if reconstruction_mode == "global" and self.params.use_view_graph_calibration:
+                if has_calibrate_view_graph:
+                    info("[COLMAP] Running view graph calibration")
 
-            reconstructions = pycolmap.incremental_mapping(
-                database_path=database_path,
-                image_path=images_dir,
-                output_path=sparse_root,
-                options=pipeline_opts,
-            )
+                    if has_view_graph_calibration_options:
+                        vg_opts = pycolmap.ViewGraphCalibrationOptions()
+                        _try_set_attr(vg_opts, "min_calibrated_pair_ratio", 0.1)
+                    else:
+                        vg_opts = None
+
+                    if vg_opts is None:
+                        calibrated = pycolmap.calibrate_view_graph(database_path)
+                    else:
+                        calibrated = pycolmap.calibrate_view_graph(
+                            database_path,
+                            options=vg_opts,
+                        )
+                    info(f"[COLMAP] View graph calibration result: {calibrated}")
+
+            if reconstruction_mode == "global":
+                if not has_global_mapping:
+                    raise RuntimeError(
+                        "This pycolmap build does not expose global_mapping(). "
+                        "Choose Incremental mode or install a COLMAP 4.x build with GLOMAP support."
+                    )
+                if not has_global_pipeline_options:
+                    raise RuntimeError(
+                        "This pycolmap build does not expose GlobalPipelineOptions. "
+                        "Choose Incremental mode or install a build with full GLOMAP support."
+                    )
+                global_opts = pycolmap.GlobalPipelineOptions()
+                _try_set_attr(global_opts, "num_threads", num_threads)
+                _try_set_attr(global_opts, "random_seed", 0)
+                _try_set_attr(global_opts, "min_num_matches", 15)
+                _try_set_attr(global_opts, "ignore_watermarks", False)
+                _try_set_attr(global_opts, "decompose_relative_pose", True)
+                if has_global_mapper_options:
+                    mapper_opts = pycolmap.GlobalMapperOptions()
+                    _try_set_attr(mapper_opts, "num_threads", num_threads)
+                    _try_set_attr(mapper_opts, "ba_num_iterations", ba_global_max_num_iterations)
+                    _try_set_attr(mapper_opts, "skip_bundle_adjustment", False)
+                    _try_set_attr(global_opts, "mapper", mapper_opts)
+                reconstructions = pycolmap.global_mapping(
+                    database_path=database_path,
+                    image_path=images_dir,
+                    output_path=sparse_root,
+                    options=global_opts,
+                )
+            else:
+                pipeline_opts = pycolmap.IncrementalPipelineOptions()
+                _try_set_attr(pipeline_opts, "ba_global_max_num_iterations", ba_global_max_num_iterations)
+                if hasattr(pipeline_opts, "multiple_models"):
+                    _try_set_attr(pipeline_opts, "multiple_models", False)
+                if hasattr(pipeline_opts, "max_num_models"):
+                    _try_set_attr(pipeline_opts, "max_num_models", 1)
+
+                reconstructions = pycolmap.incremental_mapping(
+                    database_path=database_path,
+                    image_path=images_dir,
+                    output_path=sparse_root,
+                    options=pipeline_opts,
+                )
 
             if not reconstructions:
                 raise RuntimeError("COLMAP produced no reconstruction")
@@ -597,9 +757,27 @@ class ColmapReconJob:
 
             num_images = len(reconstruction.images)
             num_points = len(reconstruction.points3D)
+            recon_metrics = _compute_recon_metrics(reconstruction)
 
-            lf.log.info(f"[COLMAP] Registered images: {num_images}")
-            lf.log.info(f"[COLMAP] Sparse points: {num_points}")
+            info(f"[COLMAP] Registered images: {num_images}")
+            info(f"[COLMAP] Sparse points: {num_points}")
+            info(
+                "[COLMAP] Mean reprojection error: "
+                f"{recon_metrics.mean_reprojection_error_px:.4f} px"
+            )
+            info(
+                "[COLMAP] Median reprojection error: "
+                f"{recon_metrics.median_reprojection_error_px:.4f} px"
+            )
+            info(
+                "[COLMAP] 90th percentile error: "
+                f"{recon_metrics.p90_reprojection_error_px:.4f} px"
+            )
+            if recon_metrics.good_ratio >= 0.0:
+                info(
+                    "[COLMAP] Points below 2.0 px: "
+                    f"{recon_metrics.good_ratio * 100.0:.1f}%"
+                )
 
             if num_images == 0:
                 raise RuntimeError("COLMAP failed: 0 registered images")
@@ -609,42 +787,13 @@ class ColmapReconJob:
 
             reconstruction.write(sparse_model_dir)
 
-            lf.log.info(f"[COLMAP] Sparse model saved to {sparse_model_dir}")
+            self._update(ReconStage.MAPPING, 90.0, "Saving sparse model")
+            info(f"[COLMAP] Sparse model saved to {sparse_model_dir}")
 
-            # Drop the large in-memory reconstruction before undistortion to reduce peak RAM.
+            # Drop the large in-memory reconstruction after saving to reduce peak RAM.
             del reconstruction
             del reconstructions
             _trim_process_memory()
-
-            # ------------------------------------------------
-            # UNDISTORTION
-            # ------------------------------------------------
-
-            self._ensure_not_cancelled()
-            self._update(ReconStage.UNDISTORTING, 85.0, "Exporting dataset")
-
-            sparse_model_dir = os.path.join(sparse_root, "0")
-
-            pycolmap.undistort_images(
-                output_path=undistorted_dir,
-                input_path=sparse_model_dir,
-                image_path=images_dir,
-                output_type=self.params.undistort_output_type,
-            )
-
-            lf.log.info("[COLMAP] Undistortion finished")
-
-            # ------------------------------------------------
-            # VALIDATION
-            # ------------------------------------------------
-
-            images_dir_check = os.path.join(undistorted_dir, "images")
-            sparse_dir_check = os.path.join(undistorted_dir, "sparse")
-
-            if not os.path.isdir(images_dir_check) or not os.path.isdir(sparse_dir_check):
-                raise RuntimeError("COLMAP export invalid: missing images/ or sparse/")
-
-            lf.log.info("[COLMAP] Dataset export valid")
 
             # ------------------------------------------------
             # DONE
@@ -654,8 +803,9 @@ class ColmapReconJob:
 
             result = ReconResult(
                 success=True,
-                recon_dir=undistorted_dir,
+                recon_dir=sparse_model_dir,
                 elapsed_s=elapsed,
+                metrics=recon_metrics,
             )
 
             with self._lock:
@@ -663,18 +813,18 @@ class ColmapReconJob:
 
             self._update(ReconStage.DONE, 100.0, "Finished")
 
-            lf.log.info(f"[COLMAP] Reconstruction completed in {elapsed:.2f}s")
+            info(f"[COLMAP] Sparse reconstruction completed in {elapsed:.2f}s")
 
         except Exception as e:
             msg = str(e)
             if msg == "Cancelled" or self._check_cancelled():
-                lf.log.info("[COLMAP] Reconstruction cancelled")
+                info("[COLMAP] Reconstruction cancelled")
                 with self._lock:
                     self._result = ReconResult(success=False, error="Cancelled")
                 self._update(ReconStage.CANCELLED, self.progress, "Cancelled")
                 return
 
-            lf.log.error(f"[COLMAP] Error: {e}")
+            error(f"[COLMAP] Error: {e}")
 
             self._update(ReconStage.ERROR, self.progress, msg)
 
@@ -705,25 +855,19 @@ class MainPanel(lf.ui.Panel):
 
         self._job: Optional[ColmapReconJob] = None
         self._last_result: Optional[ReconResult] = None
-        self._pending_import_path: Optional[str] = None
 
         self._preset_options = ["Low", "Normal", "Custom"]
-        self._preset_name = "Low"
+        self._preset_name = "Normal"
         self._matchers = ["exhaustive", "sequential", "vocab_tree"]
         self._camera_models = ["OPENCV", "PINHOLE", "SIMPLE_RADIAL", "SIMPLE_PINHOLE"]
-        self._undistort_type_idx = 0
-        self._undistort_types = ["COLMAP"]
-        self._apply_preset("Low")
-
-        self._auto_import = True
+        self._apply_preset("Normal")
 
         self._last_running = False
         self._last_stage = ""
         self._last_status = ""
         self._last_progress = -1.0
         self._last_result_key = None
-        self._cached_image_count_dir = None
-        self._cached_image_count = 0
+        self._last_log_text = ""
         self._collapsed = {"instructions", "advanced"}
 
     def on_mount(self, doc):
@@ -741,6 +885,16 @@ class MainPanel(lf.ui.Panel):
         model.bind("camera_model", lambda: self.params.camera_model, self._set_camera_model)
         model.bind("single_camera", lambda: self.params.single_camera, self._set_single_camera)
         model.bind("matcher", lambda: self.params.matcher, self._set_matcher)
+        model.bind(
+            "reconstruction_mode",
+            lambda: self.params.reconstruction_mode,
+            self._set_reconstruction_mode,
+        )
+        model.bind(
+            "use_view_graph_calibration",
+            lambda: self.params.use_view_graph_calibration,
+            self._set_view_graph_calibration,
+        )
         model.bind(
             "sift_max_image_size",
             lambda: str(self.params.sift_max_image_size),
@@ -766,34 +920,19 @@ class MainPanel(lf.ui.Panel):
             lambda: str(self.params.ba_global_max_num_iterations),
             self._set_ba_global_max_num_iterations,
         )
-        model.bind(
-            "undistort_output_type",
-            lambda: self.params.undistort_output_type,
-            self._set_undistort_output_type,
-        )
-        model.bind("auto_import", lambda: self._auto_import, self._set_auto_import)
 
         model.bind_func("has_images_dir", lambda: bool(self.images_dir.strip()))
         model.bind_func("images_dir_text", lambda: self.images_dir or "No folder selected.")
         model.bind_func("show_exhaustive_block_size", lambda: self.params.matcher == "exhaustive")
         model.bind_func("preset_description", self._preset_description)
-        model.bind_func("show_config_warning", self._show_config_warning)
-        model.bind_func("warning_text", self._warning_text)
+        model.bind_func("show_logs", self._show_logs)
+        model.bind_func("live_log_text", self._live_log_text)
         model.bind_func("show_idle", lambda: not self._is_running())
         model.bind_func("show_running", self._is_running)
         model.bind_func("stage_text", self._stage_text)
         model.bind_func("progress_value", self._progress_value)
         model.bind_func("progress_pct", self._progress_pct)
         model.bind_func("progress_status", self._progress_status)
-        model.bind_func(
-            "can_manual_import",
-            lambda: (
-                self._last_result is not None
-                and self._last_result.success
-                and not self._auto_import
-                and bool(self._last_result.recon_dir)
-            ),
-        )
         model.bind_func(
             "show_results",
             lambda: self._last_result is not None and self._last_result.success,
@@ -810,6 +949,10 @@ class MainPanel(lf.ui.Panel):
             if self._last_result and self._last_result.success
             else "",
         )
+        model.bind_func("result_sparse_points", self._result_sparse_points)
+        model.bind_func("result_mean_error", self._result_mean_error)
+        model.bind_func("result_median_error", self._result_median_error)
+        model.bind_func("result_p90_error", self._result_p90_error)
         model.bind_func(
             "show_error",
             lambda: self._last_result is not None and not self._last_result.success,
@@ -824,7 +967,6 @@ class MainPanel(lf.ui.Panel):
         model.bind_event("browse_images", self._on_browse_images)
         model.bind_event("do_start", self._on_do_start)
         model.bind_event("do_cancel", self._on_do_cancel)
-        model.bind_event("do_import", self._on_do_import)
         model.bind_event("toggle_section", self._on_toggle_section)
 
         self._handle = model.get_handle()
@@ -838,57 +980,23 @@ class MainPanel(lf.ui.Panel):
         if job_result_key is not None and job_result_key != self._last_result_key:
             self._last_result = job_result
             self._last_result_key = job_result_key
-            if (
-                job_result.success
-                and self._auto_import
-                and job_result.recon_dir
-                and self._pending_import_path is None
-            ):
-                self._pending_import_path = job_result.recon_dir
             self._dirty(
                 "show_results",
                 "result_path",
+                "result_sparse_points",
                 "result_time",
+                "result_mean_error",
+                "result_median_error",
+                "result_p90_error",
                 "show_error",
                 "error_text",
-                "can_manual_import",
             )
             dirty = True
 
-        if self._pending_import_path:
-            path = self._pending_import_path
-            self._pending_import_path = None
-            if self._job:
-                with self._job._lock:
-                    self._job._stage = ReconStage.IMPORTING
-                    self._job._progress = 98.0
-                    self._job._status = "Importing dataset into LichtFeld..."
-            try:
-                lf.load_file(path, is_dataset=True)
-                lf.log.info(f"Imported dataset: {path}")
-                if self._job:
-                    with self._job._lock:
-                        self._job._stage = ReconStage.DONE
-                        self._job._progress = 100.0
-                        self._job._status = "Imported"
-            except Exception as exc:
-                lf.log.error(f"Failed to import dataset: {exc}")
-                if self._job:
-                    with self._job._lock:
-                        self._job._stage = ReconStage.ERROR
-                        self._job._status = f"Import failed: {exc}"
-            self._dirty(
-                "show_idle",
-                "show_running",
-                "stage_text",
-                "progress_value",
-                "progress_pct",
-                "progress_status",
-                "show_results",
-                "show_error",
-                "error_text",
-                "can_manual_import",
-            )
+        current_log_text = self._live_log_text()
+        if current_log_text != self._last_log_text:
+            self._last_log_text = current_log_text
+            self._dirty("show_logs", "live_log_text")
             dirty = True
 
         running = self._is_running()
@@ -981,6 +1089,15 @@ class MainPanel(lf.ui.Panel):
             result.recon_dir,
             result.elapsed_s,
             result.error,
+            None
+            if result.metrics is None
+            else (
+                result.metrics.total_points,
+                result.metrics.mean_reprojection_error_px,
+                result.metrics.median_reprojection_error_px,
+                result.metrics.p90_reprojection_error_px,
+                result.metrics.good_ratio,
+            ),
         )
 
     def _stage_text(self) -> str:
@@ -1003,58 +1120,40 @@ class MainPanel(lf.ui.Panel):
             return ""
         return self._job.status or ""
 
-    def _show_config_warning(self) -> bool:
-        return (
-            self.params.sift_max_num_features > 4096
-            or self.params.sift_max_num_matches > 4096
-            or self.params.matcher == "exhaustive"
-        )
+    def _show_logs(self) -> bool:
+        return bool(self._live_log_text())
 
-    def _warning_text(self) -> str:
-        reasons = []
-        if self.params.sift_max_num_features > 4096:
-            reasons.append("feature count is above 4096")
-        if self.params.sift_max_num_matches > 4096:
-            reasons.append("match count is above 4096")
-        if self.params.matcher == "exhaustive":
-            reasons.append("exhaustive matching scales poorly on large image sets")
-            image_count = self._selected_image_count()
-            if image_count > 100:
-                reasons.append(f"the selected folder has {image_count} images")
-        if not reasons:
+    def _live_log_text(self) -> str:
+        if not self._job:
             return ""
-        return "Warning: higher-memory configuration enabled because " + "; ".join(reasons) + "."
+        return self._job.log_text
 
-    def _selected_image_count(self) -> int:
-        images_dir = (self.images_dir or "").strip()
-        if images_dir == self._cached_image_count_dir:
-            return self._cached_image_count
-        if not images_dir or not os.path.isdir(images_dir):
-            self._cached_image_count_dir = images_dir
-            self._cached_image_count = 0
-            return 0
-        try:
-            count = sum(
-                1
-                for name in os.listdir(images_dir)
-                if name.lower().endswith((".jpg", ".jpeg", ".png"))
-            )
-        except Exception:
-            count = 0
-        self._cached_image_count_dir = images_dir
-        self._cached_image_count = count
-        return count
+    def _result_metrics(self) -> Optional[ReconMetrics]:
+        if not self._last_result or not self._last_result.success:
+            return None
+        return self._last_result.metrics
+
+    def _result_sparse_points(self) -> str:
+        metrics = self._result_metrics()
+        return str(metrics.total_points) if metrics is not None else "0"
+
+    def _result_mean_error(self) -> str:
+        metrics = self._result_metrics()
+        return _format_metric_px(metrics.mean_reprojection_error_px) if metrics is not None else "N/A"
+
+    def _result_median_error(self) -> str:
+        metrics = self._result_metrics()
+        return _format_metric_px(metrics.median_reprojection_error_px) if metrics is not None else "N/A"
+
+    def _result_p90_error(self) -> str:
+        metrics = self._result_metrics()
+        return _format_metric_px(metrics.p90_reprojection_error_px) if metrics is not None else "N/A"
 
     def _sync_choice_indices_from_params(self) -> None:
         self._matcher_idx = self._matchers.index(self.params.matcher) if self.params.matcher in self._matchers else 0
         self._camera_model_idx = (
             self._camera_models.index(self.params.camera_model)
             if self.params.camera_model in self._camera_models
-            else 0
-        )
-        self._undistort_type_idx = (
-            self._undistort_types.index(self.params.undistort_output_type)
-            if self.params.undistort_output_type in self._undistort_types
             else 0
         )
 
@@ -1079,6 +1178,8 @@ class MainPanel(lf.ui.Panel):
             "camera_model",
             "single_camera",
             "matcher",
+            "reconstruction_mode",
+            "use_view_graph_calibration",
             "sift_max_image_size",
             "sift_max_num_features",
             "sift_max_num_matches",
@@ -1086,8 +1187,6 @@ class MainPanel(lf.ui.Panel):
             "ba_global_max_num_iterations",
             "show_exhaustive_block_size",
             "preset_description",
-            "show_config_warning",
-            "warning_text",
         )
 
     def _preset_description(self) -> str:
@@ -1145,9 +1244,7 @@ class MainPanel(lf.ui.Panel):
 
     def _set_images_dir(self, value):
         self.images_dir = str(value or "").strip()
-        self._cached_image_count_dir = None
-        self._cached_image_count = 0
-        self._dirty("images_dir", "images_dir_text", "has_images_dir", "show_config_warning", "warning_text")
+        self._dirty("images_dir", "images_dir_text", "has_images_dir")
 
     def _set_camera_model(self, value):
         value = str(value or "")
@@ -1170,7 +1267,21 @@ class MainPanel(lf.ui.Panel):
             self.params.matcher = value
             self._matcher_idx = self._matchers.index(value)
             self._set_custom_preset()
-            self._dirty("matcher", "show_exhaustive_block_size", "show_config_warning", "warning_text")
+            self._dirty("matcher", "show_exhaustive_block_size")
+
+    def _set_reconstruction_mode(self, value):
+        value = str(value or "")
+        if value in ("incremental", "global") and value != self.params.reconstruction_mode:
+            self.params.reconstruction_mode = value
+            self._set_custom_preset()
+            self._dirty("reconstruction_mode")
+
+    def _set_view_graph_calibration(self, value):
+        enabled = bool(value)
+        if enabled != self.params.use_view_graph_calibration:
+            self.params.use_view_graph_calibration = enabled
+            self._set_custom_preset()
+            self._dirty("use_view_graph_calibration")
 
     def _set_sift_max_image_size(self, value):
         self._set_int_param("sift_max_image_size", value, 800, 2400)
@@ -1187,17 +1298,6 @@ class MainPanel(lf.ui.Panel):
     def _set_ba_global_max_num_iterations(self, value):
         self._set_int_param("ba_global_max_num_iterations", value, 10, 100)
 
-    def _set_undistort_output_type(self, value):
-        value = str(value or "")
-        if value in self._undistort_types:
-            self.params.undistort_output_type = value
-            self._undistort_type_idx = self._undistort_types.index(value)
-            self._dirty("undistort_output_type")
-
-    def _set_auto_import(self, value):
-        self._auto_import = bool(value)
-        self._dirty("auto_import", "can_manual_import")
-
     def _set_int_param(self, name: str, value, min_value: int, max_value: int):
         try:
             parsed = int(float(value))
@@ -1208,16 +1308,14 @@ class MainPanel(lf.ui.Panel):
         if parsed != current:
             setattr(self.params, name, parsed)
             self._set_custom_preset()
-            self._dirty(name, "show_config_warning", "warning_text")
+            self._dirty(name)
 
     def _on_browse_images(self, handle, event, args):
         del handle, event, args
         picked = lf.ui.open_folder_dialog("Select image folder", self.images_dir or os.getcwd())
         if picked:
             self.images_dir = picked
-            self._cached_image_count_dir = None
-            self._cached_image_count = 0
-            self._dirty("images_dir", "images_dir_text", "has_images_dir", "show_config_warning", "warning_text")
+            self._dirty("images_dir", "images_dir_text", "has_images_dir")
 
     def _on_do_start(self, handle, event, args):
         del handle, event, args
@@ -1225,14 +1323,21 @@ class MainPanel(lf.ui.Panel):
         self._dirty(
             "show_idle",
             "show_running",
+            "show_logs",
+            "live_log_text",
             "show_results",
+            "result_path",
+            "result_sparse_points",
+            "result_time",
+            "result_mean_error",
+            "result_median_error",
+            "result_p90_error",
             "show_error",
             "error_text",
             "stage_text",
             "progress_value",
             "progress_pct",
             "progress_status",
-            "can_manual_import",
         )
 
     def _on_do_cancel(self, handle, event, args):
@@ -1240,12 +1345,6 @@ class MainPanel(lf.ui.Panel):
         if self._job and self._job.is_running():
             self._job.cancel()
             self._dirty("stage_text", "progress_status")
-
-    def _on_do_import(self, handle, event, args):
-        del handle, event, args
-        if self._last_result and self._last_result.success and self._last_result.recon_dir:
-            self._pending_import_path = self._last_result.recon_dir
-            self._dirty("can_manual_import")
 
     def _start_job(self):
         images_dir = (self.images_dir or "").strip()
@@ -1256,7 +1355,7 @@ class MainPanel(lf.ui.Panel):
 
         self._last_result = None
         self._last_result_key = None
-        self._pending_import_path = None
+        self._last_log_text = ""
 
         # Snapshot params so UI edits during a run don't affect the active reconstruction.
         job_params = ColmapParams(**vars(self.params))

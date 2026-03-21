@@ -1,19 +1,13 @@
 [project]
-name = "Lichtfeld-COLMAP-Plugin"
+name = "colmap_plugin"
 version = "0.1.0"
 requires-python = ">=3.12"
 description="COLMAP reconstruction plugin"
 
 dependencies = [
-  "onnxruntime-gpu==1.24.1",
-  "pycolmap==4.0.1",
+  "pycolmap",
 ]
 
-[tool.uv.sources]
-pycolmap = [
-  { url = "https://github.com/lyehe/build_gpu_colmap/releases/download/v4.0.1/pycolmap-4.0.1%2Bcpu-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux'" },
-  { url = "https://github.com/lyehe/build_gpu_colmap/releases/download/v4.0.1/pycolmap-4.0.1%2Bcpu-cp312-cp312-win_amd64.whl", marker = "sys_platform == 'win32'" }
-]
 [tool.lichtfeld]
 hot_reload = true
 plugin_api = ">=1,<2"

@@ -150,12 +150,17 @@ body {
     margin-bottom: 4dp;
 }
 
-.status-warning {
+.log-box {
+    padding: 8dp;
+    border-radius: 6dp;
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.log-output {
     display: block;
-    color: #ffb347;
-    font-size: 10dp;
-    margin-bottom: 4dp;
+    font-size: 8.5dp;
     line-height: 1.35;
+    white-space: pre-wrap;
 }
 
 .scrub-field {
