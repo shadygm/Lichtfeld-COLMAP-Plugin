@@ -105,6 +105,7 @@ PRESET_NORMAL_PARAMS = dict(
 )
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+COLMAP_MODEL_BASENAMES = ("cameras", "images", "points3D")
 
 
 def _try_set_attr(obj, attr: str, value) -> bool:
@@ -135,6 +136,15 @@ def _reset_directory(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _remove_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    path.unlink()
 
 
 def _link_or_copy_file(source: Path, target: Path) -> None:
@@ -172,6 +182,106 @@ def _stage_flat_directory(
         staged_count += 1
 
     return staged_count
+
+
+def _count_files_in_directory(
+    directory: Path,
+    *,
+    allowed_extensions: Optional[tuple[str, ...]] = None,
+) -> int:
+    if not directory.is_dir():
+        return 0
+    return sum(
+        1
+        for entry in directory.iterdir()
+        if entry.is_file() and (allowed_extensions is None or entry.suffix.lower() in allowed_extensions)
+    )
+
+
+def _is_colmap_model_directory(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    filenames = {entry.name for entry in path.iterdir() if entry.is_file()}
+    return any(
+        all(f"{basename}{suffix}" in filenames for basename in COLMAP_MODEL_BASENAMES)
+        for suffix in (".bin", ".txt")
+    )
+
+
+def _resolve_sparse_model_path(path: Path) -> Path:
+    if _is_colmap_model_directory(path):
+        return path
+    if not path.is_dir():
+        return path
+    for child in sorted(path.iterdir(), key=lambda entry: entry.name.lower()):
+        if child.is_dir() and _is_colmap_model_directory(child):
+            return child
+    return path
+
+
+def _undistort_dataset(
+    *,
+    sparse_model_path: Path,
+    source_images_path: Path,
+    output_root_path: Path,
+) -> tuple[Path, Path, int]:
+    if not hasattr(pycolmap, "undistort_images"):
+        raise RuntimeError(
+            "This pycolmap build does not expose undistort_images(). "
+            "Install a build with image undistortion support."
+        )
+
+    _reset_directory(output_root_path)
+
+    undistort_kwargs = {
+        "output_path": os.fspath(output_root_path),
+        "input_path": os.fspath(sparse_model_path),
+        "image_path": os.fspath(source_images_path),
+        "output_type": "COLMAP",
+    }
+
+    copy_type = getattr(pycolmap, "CopyType", None)
+    if copy_type is not None:
+        copy_value = getattr(copy_type, "copy", None)
+        if copy_value is not None:
+            undistort_kwargs["copy_policy"] = copy_value
+
+    if hasattr(pycolmap, "UndistortCameraOptions"):
+        undistort_kwargs["undistort_options"] = pycolmap.UndistortCameraOptions()
+
+    try:
+        pycolmap.undistort_images(**undistort_kwargs)
+    except TypeError as exc:
+        fallback_kwargs = dict(undistort_kwargs)
+        for key in ("undistort_options", "copy_policy", "output_type"):
+            if key not in fallback_kwargs:
+                continue
+            fallback_kwargs.pop(key, None)
+            try:
+                pycolmap.undistort_images(**fallback_kwargs)
+                break
+            except TypeError:
+                continue
+        else:
+            raise RuntimeError(f"pycolmap.undistort_images() failed: {exc}") from exc
+
+    undistorted_images_path = output_root_path / "images"
+    undistorted_sparse_path = _resolve_sparse_model_path(output_root_path / "sparse")
+    undistorted_image_count = _count_files_in_directory(
+        undistorted_images_path,
+        allowed_extensions=IMAGE_EXTENSIONS,
+    )
+
+    if undistorted_image_count == 0:
+        raise RuntimeError(
+            f"COLMAP undistortion did not produce any images in {undistorted_images_path}"
+        )
+    if not _is_colmap_model_directory(undistorted_sparse_path):
+        raise RuntimeError(
+            f"COLMAP undistortion did not produce a sparse model in {output_root_path / 'sparse'}"
+        )
+
+    return undistorted_images_path, undistorted_sparse_path, undistorted_image_count
 
 
 @dataclass
@@ -388,6 +498,7 @@ class ColmapReconJob:
         info = self._log_info
         warn = self._log_warn
         error = self._log_error
+        work_root_path: Optional[Path] = None
 
         try:
             self._update(ReconStage.CHECKING, 2.0, "Checking inputs")
@@ -479,26 +590,32 @@ class ColmapReconJob:
             dataset_masks_path = recon_root_path / "masks"
             sparse_root_path = recon_root_path / "sparse"
             work_root_path = recon_root_path / ".colmap"
+            staged_images_path = work_root_path / "images"
             mapping_root_path = work_root_path / "mapping"
+            temp_publish_root_path = work_root_path / "publish"
+
+            _reset_directory(work_root_path)
+            mapping_root_path.mkdir(parents=True, exist_ok=True)
 
             staged_image_count = _stage_flat_directory(
                 images_path,
-                dataset_images_path,
+                staged_images_path,
                 allowed_extensions=IMAGE_EXTENSIONS,
             )
 
             if masks_source_path.is_dir():
-                _stage_flat_directory(masks_source_path, dataset_masks_path)
-                info(f"[COLMAP] Masks directory ready: {dataset_masks_path}")
+                warn(
+                    "[COLMAP] Source masks were detected, but they are not copied because the final "
+                    "published dataset uses undistorted images."
+                )
             elif dataset_masks_path.exists() and not _same_path(masks_source_path, dataset_masks_path):
                 shutil.rmtree(dataset_masks_path)
 
             _reset_directory(sparse_root_path)
-            _reset_directory(work_root_path)
-            mapping_root_path.mkdir(parents=True, exist_ok=True)
 
             info(f"[COLMAP] Dataset root: {recon_root_path}")
-            info(f"[COLMAP] Images directory: {dataset_images_path}")
+            info(f"[COLMAP] Temporary images directory: {staged_images_path}")
+            info(f"[COLMAP] Final images directory: {dataset_images_path}")
             info(f"[COLMAP] Prepared {staged_image_count} images for reconstruction")
 
             database_path = os.fspath(work_root_path / "database.db")
@@ -567,7 +684,7 @@ class ColmapReconJob:
             # Build extract_kwargs based on available API
             extract_kwargs = dict(
                 database_path=database_path,
-                image_path=os.fspath(dataset_images_path),
+                image_path=os.fspath(staged_images_path),
                 camera_mode=camera_mode,
             )
 
@@ -810,7 +927,7 @@ class ColmapReconJob:
                     _try_set_attr(global_opts, "mapper", mapper_opts)
                 reconstructions = pycolmap.global_mapping(
                     database_path=database_path,
-                    image_path=os.fspath(dataset_images_path),
+                    image_path=os.fspath(staged_images_path),
                     output_path=mapping_root,
                     options=global_opts,
                 )
@@ -824,7 +941,7 @@ class ColmapReconJob:
 
                 reconstructions = pycolmap.incremental_mapping(
                     database_path=database_path,
-                    image_path=os.fspath(dataset_images_path),
+                    image_path=os.fspath(staged_images_path),
                     output_path=mapping_root,
                     options=pipeline_opts,
                 )
@@ -877,8 +994,38 @@ class ColmapReconJob:
                 except Exception as exc:
                     warn(f"[COLMAP] Could not export PLY: {exc}")
 
-            self._update(ReconStage.MAPPING, 90.0, "Saving sparse model")
-            shutil.rmtree(work_root_path, ignore_errors=True)
+            self._ensure_not_cancelled()
+            self._update(ReconStage.MAPPING, 90.0, "Publishing undistorted dataset")
+            info(f"[COLMAP] Publishing undistorted dataset to {recon_root_path}")
+
+            _undistort_dataset(
+                sparse_model_path=sparse_root_path,
+                source_images_path=staged_images_path,
+                output_root_path=temp_publish_root_path,
+            )
+
+            if masks_source_path.is_dir():
+                warn(
+                    "[COLMAP] Masks were not published because they do not match the undistorted images."
+                )
+
+            _remove_path(dataset_images_path)
+            shutil.move(os.fspath(temp_publish_root_path / "images"), os.fspath(dataset_images_path))
+
+            _remove_path(sparse_root_path)
+            shutil.move(os.fspath(temp_publish_root_path / "sparse"), os.fspath(sparse_root_path))
+
+            final_dataset_path = recon_root_path
+            final_images_path = dataset_images_path
+            final_sparse_root = _resolve_sparse_model_path(sparse_root_path)
+            info(f"[COLMAP] Final dataset root: {final_dataset_path}")
+            info(f"[COLMAP] Final images directory: {final_images_path}")
+            info(f"[COLMAP] Final sparse model: {final_sparse_root}")
+            info(
+                "[COLMAP] Prepared "
+                f"{_count_files_in_directory(final_images_path, allowed_extensions=IMAGE_EXTENSIONS)} "
+                "undistorted images for training"
+            )
 
             # Drop the large in-memory reconstruction after saving to reduce peak RAM.
             del reconstruction
@@ -893,8 +1040,8 @@ class ColmapReconJob:
 
             result = ReconResult(
                 success=True,
-                recon_dir=sparse_root,
-                dataset_dir=recon_root,
+                recon_dir=os.fspath(final_sparse_root),
+                dataset_dir=os.fspath(final_dataset_path),
                 elapsed_s=elapsed,
                 metrics=recon_metrics,
             )
@@ -921,6 +1068,9 @@ class ColmapReconJob:
 
             with self._lock:
                 self._result = ReconResult(success=False, error=msg)
+        finally:
+            if work_root_path is not None:
+                shutil.rmtree(work_root_path, ignore_errors=True)
 
 
 class MainPanel(lf.ui.Panel):

@@ -56,10 +56,4 @@ The plugin writes a standard COLMAP-style dataset layout. If you select an exist
 └── sparse/
 ```
 
-The final sparse model is saved directly here:
-
-```text
-<dataset_root>/sparse/
-```
-
-After a successful reconstruction, the plugin also loads `<dataset_root>/` into LichtFeld as a normal dataset.
+After a successful reconstruction, the plugin loads `<dataset_root>/` into LichtFeld as the dataset for training.

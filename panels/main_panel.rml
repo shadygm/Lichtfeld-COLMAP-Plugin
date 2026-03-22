@@ -15,7 +15,7 @@
     </div>
     <div class="section-content collapsed" id="sec-instructions">
       <span class="help-text text-muted">Select an image folder and run sparse COLMAP reconstruction.</span>
-      <span class="help-text text-muted">The sparse model is saved next to the images.</span>
+      <span class="help-text text-muted">The published dataset keeps the usual root layout, with `images/` replaced by undistorted images for training.</span>
     </div>
   </div>
 
@@ -145,7 +145,7 @@
   <div data-if="show_results">
     <div class="separator"></div>
     <span class="section-title text-accent">Result</span>
-    <span class="result-line text-default">Sparse model: {{result_path}}</span>
+    <span class="result-line text-default">Final dataset: {{result_path}}</span>
     <span class="result-line text-default">Sparse points: {{result_sparse_points}}</span>
     <span class="result-line text-default">Elapsed: {{result_time}}</span>
     <span class="result-line text-default">Mean reprojection error: {{result_mean_error}}</span>
