@@ -1,4 +1,5 @@
 """COLMAP reconstruction + dataset import panel."""
+
 from __future__ import annotations
 
 import ctypes
@@ -6,6 +7,7 @@ import gc
 import math
 import os
 import shutil
+import sys
 import threading
 import time
 from collections import deque
@@ -129,7 +131,9 @@ def _trim_process_memory() -> None:
 
 
 def _same_path(left: Path, right: Path) -> bool:
-    return os.path.normcase(os.path.abspath(os.fspath(left))) == os.path.normcase(os.path.abspath(os.fspath(right)))
+    return os.path.normcase(os.path.abspath(os.fspath(left))) == os.path.normcase(
+        os.path.abspath(os.fspath(right))
+    )
 
 
 def _reset_directory(path: Path) -> None:
@@ -167,7 +171,10 @@ def _stage_flat_directory(
         return sum(
             1
             for entry in source_dir.iterdir()
-            if entry.is_file() and (allowed_extensions is None or entry.suffix.lower() in allowed_extensions)
+            if entry.is_file()
+            and (
+                allowed_extensions is None or entry.suffix.lower() in allowed_extensions
+            )
         )
 
     _reset_directory(target_dir)
@@ -176,7 +183,10 @@ def _stage_flat_directory(
     for entry in sorted(source_dir.iterdir(), key=lambda path: path.name.lower()):
         if not entry.is_file():
             continue
-        if allowed_extensions is not None and entry.suffix.lower() not in allowed_extensions:
+        if (
+            allowed_extensions is not None
+            and entry.suffix.lower() not in allowed_extensions
+        ):
             continue
         _link_or_copy_file(entry, target_dir / entry.name)
         staged_count += 1
@@ -194,7 +204,8 @@ def _count_files_in_directory(
     return sum(
         1
         for entry in directory.iterdir()
-        if entry.is_file() and (allowed_extensions is None or entry.suffix.lower() in allowed_extensions)
+        if entry.is_file()
+        and (allowed_extensions is None or entry.suffix.lower() in allowed_extensions)
     )
 
 
@@ -301,6 +312,11 @@ class ColmapParams:
 
     # Mapping
     ba_global_max_num_iterations: int = 50
+
+    # GPU settings
+    use_gpu: bool = True
+    gpu_index: int = 0
+    gpu_fallback: bool = True
 
 
 @dataclass
@@ -513,7 +529,8 @@ class ColmapReconJob:
             # ------------------------------------------------
 
             image_files = [
-                f for f in os.listdir(images_dir)
+                f
+                for f in os.listdir(images_dir)
                 if f.lower().endswith(IMAGE_EXTENSIONS)
             ]
 
@@ -526,7 +543,9 @@ class ColmapReconJob:
             sift_max_num_features = max(1024, int(self.params.sift_max_num_features))
             sift_max_num_matches = max(1024, int(self.params.sift_max_num_matches))
             exhaustive_block_size = max(5, int(self.params.exhaustive_block_size))
-            ba_global_max_num_iterations = max(1, int(self.params.ba_global_max_num_iterations))
+            ba_global_max_num_iterations = max(
+                1, int(self.params.ba_global_max_num_iterations)
+            )
             matcher_name = self.params.matcher
             reconstruction_mode = self.params.reconstruction_mode
             num_threads = min(8, os.cpu_count() or 4)
@@ -543,6 +562,8 @@ class ColmapReconJob:
                 f"ba_global_max_num_iterations={ba_global_max_num_iterations}"
             )
 
+            info("[COLMAP] GPU acceleration enabled")
+
             # ------------------------------------------------
             # Setup folders
             # ------------------------------------------------
@@ -552,7 +573,9 @@ class ColmapReconJob:
                 recon_root_path = images_path.parent
                 dataset_images_path = images_path
             else:
-                recon_root_path = images_path.parent / f"{images_path.name}_reconstruction"
+                recon_root_path = (
+                    images_path.parent / f"{images_path.name}_reconstruction"
+                )
                 dataset_images_path = recon_root_path / "images"
 
             recon_root = os.fspath(recon_root_path)
@@ -560,10 +583,14 @@ class ColmapReconJob:
 
             # Validate recon_root is writable and disk has space
             if not os.path.isdir(recon_root):
-                raise RuntimeError(f"Failed to create reconstruction directory: {recon_root}")
+                raise RuntimeError(
+                    f"Failed to create reconstruction directory: {recon_root}"
+                )
 
             if not os.access(recon_root, os.W_OK):
-                raise RuntimeError(f"Reconstruction directory is not writable: {recon_root}")
+                raise RuntimeError(
+                    f"Reconstruction directory is not writable: {recon_root}"
+                )
 
             # Test write permissions by attempting to create a temporary file
             test_file = os.path.join(recon_root, ".colmap_write_test")
@@ -580,7 +607,7 @@ class ColmapReconJob:
             # Check available disk space (warn if < 500 MB)
             try:
                 stat = shutil.disk_usage(recon_root)
-                free_gb = stat.free / (1024 ** 3)
+                free_gb = stat.free / (1024**3)
                 if free_gb < 0.5:
                     warn(f"[COLMAP] Low disk space: only {free_gb:.2f} GiB available")
             except Exception:
@@ -608,7 +635,9 @@ class ColmapReconJob:
                     "[COLMAP] Source masks were detected, but they are not copied because the final "
                     "published dataset uses undistorted images."
                 )
-            elif dataset_masks_path.exists() and not _same_path(masks_source_path, dataset_masks_path):
+            elif dataset_masks_path.exists() and not _same_path(
+                masks_source_path, dataset_masks_path
+            ):
                 shutil.rmtree(dataset_masks_path)
 
             _reset_directory(sparse_root_path)
@@ -621,12 +650,18 @@ class ColmapReconJob:
             database_path = os.fspath(work_root_path / "database.db")
 
             # Clean up any corrupted database from previous failed runs, including WAL and SHM files
-            for db_file in [database_path, f"{database_path}-wal", f"{database_path}-shm"]:
+            for db_file in [
+                database_path,
+                f"{database_path}-wal",
+                f"{database_path}-shm",
+            ]:
                 if os.path.exists(db_file):
                     try:
                         os.remove(db_file)
                         if db_file == database_path:
-                            info(f"[COLMAP] Removed existing database file: {database_path}")
+                            info(
+                                f"[COLMAP] Removed existing database file: {database_path}"
+                            )
                     except OSError as e:
                         warn(f"[COLMAP] Could not remove {db_file}: {e}")
                         if db_file == database_path:
@@ -649,96 +684,47 @@ class ColmapReconJob:
 
             info("[COLMAP] Extracting features")
 
-            camera_mode = CameraMode.SINGLE if self.params.single_camera else CameraMode.AUTO
-
-            # Build reader_options (for camera_model) and extraction_options (for SIFT settings)
-            reader_opts = None
-            extraction_opts = None
-            extraction_gpu_requested = False
-            extraction_gpu_used = False
-
-            # Try ImageReaderOptions (newer API)
-            if hasattr(pycolmap, "ImageReaderOptions"):
-                reader_opts = pycolmap.ImageReaderOptions()
-                _try_set_attr(reader_opts, "camera_model", self.params.camera_model)
-
-            # Try FeatureExtractionOptions (newer API) or SiftExtractionOptions (older)
-            if hasattr(pycolmap, "FeatureExtractionOptions"):
-                extraction_opts = pycolmap.FeatureExtractionOptions()
-                extraction_gpu_requested = _try_set_attr(extraction_opts, "use_gpu", True) or extraction_gpu_requested
-                _try_set_attr(extraction_opts, "num_threads", num_threads)
-                _try_set_attr(extraction_opts, "max_image_size", sift_max_image_size)
-                _try_set_attr(extraction_opts, "max_num_features", sift_max_num_features)
-            elif hasattr(pycolmap, "SiftExtractionOptions"):
-                extraction_opts = pycolmap.SiftExtractionOptions()
-                extraction_gpu_requested = _try_set_attr(extraction_opts, "use_gpu", True) or extraction_gpu_requested
-                _try_set_attr(extraction_opts, "num_threads", num_threads)
-                _try_set_attr(extraction_opts, "max_image_size", sift_max_image_size)
-                _try_set_attr(extraction_opts, "max_num_features", sift_max_num_features)
-
-            info(
-                "[COLMAP] Feature extraction compute mode: "
-                + ("GPU requested" if extraction_gpu_requested else "CPU only")
+            camera_mode = (
+                CameraMode.SINGLE if self.params.single_camera else CameraMode.AUTO
             )
 
-            # Build extract_kwargs based on available API
-            extract_kwargs = dict(
-                database_path=database_path,
-                image_path=os.fspath(staged_images_path),
-                camera_mode=camera_mode,
-            )
+            # Build reader_options and extraction_options (newer API)
+            reader_options = pycolmap.ImageReaderOptions()
+            reader_options.camera_model = self.params.camera_model
 
-            # Prefer new API: reader_options + extraction_options
-            if reader_opts is not None:
-                extract_kwargs["reader_options"] = reader_opts
-            else:
-                # Fallback: try old API with camera_model parameter
-                extract_kwargs["camera_model"] = self.params.camera_model
+            extraction_options = pycolmap.FeatureExtractionOptions()
+            # Set SIFT type if available
+            if hasattr(pycolmap, "FeatureExtractorType"):
+                extraction_options.type = pycolmap.FeatureExtractorType.SIFT
+            extraction_options.max_image_size = sift_max_image_size
+            extraction_options.sift.max_num_features = sift_max_num_features
 
-            # Try newer extraction_options name first, fall back to sift_options
-            if extraction_opts is not None:
-                if hasattr(pycolmap, "FeatureExtractionOptions"):
-                    extract_kwargs["extraction_options"] = extraction_opts
-                else:
-                    extract_kwargs["sift_options"] = extraction_opts
-
-            def _call_extract() -> None:
-                try:
-                    pycolmap.extract_features(**extract_kwargs)
-                except TypeError as e:
-                    fallback_kwargs = dict(extract_kwargs)
-                    for k in ("extraction_options", "sift_options", "reader_options", "camera_model"):
-                        if k in fallback_kwargs:
-                            fallback_kwargs.pop(k)
-                            try:
-                                pycolmap.extract_features(**fallback_kwargs)
-                                return
-                            except TypeError:
-                                continue
-                    error(f"[COLMAP] extract_features() failed with error: {e}")
-                    raise
-
+            # Try GPU first, fallback to CPU if needed
+            _try_set_attr(extraction_options, "use_gpu", True)
             try:
-                _call_extract()
-                extraction_gpu_used = extraction_gpu_requested
+                info("[COLMAP] Feature extraction using GPU")
+                pycolmap.extract_features(
+                    database_path=database_path,
+                    image_path=os.fspath(staged_images_path),
+                    camera_mode=camera_mode,
+                    reader_options=reader_options,
+                    extraction_options=extraction_options,
+                )
+                info("[COLMAP] Feature extraction finished using GPU")
             except Exception as exc:
-                if extraction_gpu_requested and extraction_opts is not None and _try_set_attr(extraction_opts, "use_gpu", False):
-                    warn(
-                        "[COLMAP] GPU feature extraction failed "
-                        f"({exc}); retrying on CPU."
+                if "CUDA" in str(exc) or "gpu" in str(exc).lower():
+                    warn(f"[COLMAP] GPU extraction failed ({exc}), retrying with CPU")
+                    _try_set_attr(extraction_options, "use_gpu", False)
+                    pycolmap.extract_features(
+                        database_path=database_path,
+                        image_path=os.fspath(staged_images_path),
+                        camera_mode=camera_mode,
+                        reader_options=reader_options,
+                        extraction_options=extraction_options,
                     )
-                    _call_extract()
-                    extraction_gpu_used = False
+                    info("[COLMAP] Feature extraction finished using CPU")
                 else:
                     raise
-
-            info(
-                "[COLMAP] Feature extraction finished "
-                f"using {'GPU' if extraction_gpu_used else 'CPU'}"
-            )
-            del reader_opts
-            del extraction_opts
-            del extract_kwargs
             _trim_process_memory()
 
             # ------------------------------------------------
@@ -750,78 +736,42 @@ class ColmapReconJob:
 
             info("[COLMAP] Matching images")
 
-            sift_matching_opts = None
-            matching_gpu_requested = False
-            matching_gpu_used = False
-            if hasattr(pycolmap, "SiftMatchingOptions"):
-                sift_matching_opts = pycolmap.SiftMatchingOptions()
-                matching_gpu_requested = _try_set_attr(sift_matching_opts, "use_gpu", True) or matching_gpu_requested
-                _try_set_attr(sift_matching_opts, "num_threads", num_threads)
-                _try_set_attr(sift_matching_opts, "max_num_matches", sift_max_num_matches)
+            # Build matching options with GPU enabled
+            matching_opts = pycolmap.FeatureMatchingOptions()
+            _try_set_attr(matching_opts, "use_gpu", True)
+            _try_set_attr(matching_opts, "max_num_matches", sift_max_num_matches)
 
-            info(
-                "[COLMAP] Matching compute mode: "
-                + ("GPU requested" if matching_gpu_requested else "CPU only")
-            )
-
-            def _run_matcher(fn_name: str, match_kwargs: dict, drop_order: tuple[str, ...]) -> bool:
+            def _run_match(fn_name: str, match_kwargs: dict) -> None:
+                """Run matcher with GPU fallback to CPU."""
                 fn = getattr(pycolmap, fn_name, None)
                 if fn is None:
-                    return False
+                    raise RuntimeError(f"pycolmap.{fn_name} is unavailable")
                 try:
                     fn(**match_kwargs)
-                    return True
-                except TypeError:
-                    fallback_kwargs = dict(match_kwargs)
-                    for key in drop_order:
-                        if key in fallback_kwargs:
-                            fallback_kwargs.pop(key, None)
-                            try:
-                                fn(**fallback_kwargs)
-                                return True
-                            except TypeError:
-                                continue
-                    raise
-
-            def _run_matcher_with_gpu_fallback(fn_name: str, match_kwargs: dict, drop_order: tuple[str, ...]) -> bool:
-                nonlocal matching_gpu_used
-                try:
-                    result = _run_matcher(fn_name, match_kwargs, drop_order)
-                    matching_gpu_used = matching_gpu_requested
-                    return result
                 except Exception as exc:
-                    if (
-                        matching_gpu_requested
-                        and sift_matching_opts is not None
-                        and _try_set_attr(sift_matching_opts, "use_gpu", False)
-                    ):
-                        warn(
-                            f"[COLMAP] GPU matching failed in {fn_name} "
-                            f"({exc}); retrying on CPU."
-                        )
-                        result = _run_matcher(fn_name, match_kwargs, drop_order)
-                        matching_gpu_used = False
-                        return result
-                    raise
+                    if "CUDA" in str(exc) or "gpu" in str(exc).lower():
+                        warn(f"[COLMAP] GPU matching failed ({exc}), retrying with CPU")
+                        # Find and update the matching_options to disable GPU
+                        if "matching_options" in match_kwargs:
+                            opts = match_kwargs["matching_options"]
+                            _try_set_attr(opts, "use_gpu", False)
+                        fn(**match_kwargs)
+                        info(f"[COLMAP] {fn_name} finished using CPU")
+                    else:
+                        raise
 
             if matcher_name == "vocab_tree":
-                match_kwargs = {"database_path": database_path}
-                if sift_matching_opts is not None:
-                    match_kwargs["sift_options"] = sift_matching_opts
-                vocab_opts = None
-                if hasattr(pycolmap, "VocabTreeMatchingOptions"):
-                    vocab_opts = pycolmap.VocabTreeMatchingOptions()
-                    _try_set_attr(vocab_opts, "num_images", 100)
-                    _try_set_attr(vocab_opts, "num_nearest_neighbors", 5)
-                    match_kwargs["matching_options"] = vocab_opts
                 if hasattr(pycolmap, "match_vocab_tree"):
                     try:
-                        if not _run_matcher_with_gpu_fallback(
-                            "match_vocab_tree",
-                            match_kwargs,
-                            ("matching_options", "sift_options"),
-                        ):
-                            raise RuntimeError("pycolmap.match_vocab_tree is unavailable")
+                        pairing_opts = pycolmap.VocabTreePairingOptions()
+                        _try_set_attr(pairing_opts, "num_images", 100)
+                        _try_set_attr(pairing_opts, "num_nearest_neighbors", 5)
+                        match_kwargs = {
+                            "database_path": database_path,
+                            "matching_options": matching_opts,
+                            "pairing_options": pairing_opts,
+                        }
+                        _run_match("match_vocab_tree", match_kwargs)
                     except Exception as exc:
                         warn(
                             "[COLMAP] Vocab tree matching unavailable or failed "
@@ -836,37 +786,26 @@ class ColmapReconJob:
                     matcher_name = "sequential"
 
             if matcher_name == "sequential":
-                match_kwargs = {"database_path": database_path}
-                if sift_matching_opts is not None:
-                    match_kwargs["sift_options"] = sift_matching_opts
-                if hasattr(pycolmap, "SequentialMatchingOptions"):
-                    match_kwargs["matching_options"] = pycolmap.SequentialMatchingOptions()
-                if not _run_matcher_with_gpu_fallback(
-                    "match_sequential",
-                    match_kwargs,
-                    ("matching_options", "sift_options"),
-                ):
-                    raise RuntimeError("pycolmap.match_sequential is unavailable")
+                pairing_opts = pycolmap.SequentialPairingOptions()
+                _try_set_attr(pairing_opts, "loop_detection", True)
+                match_kwargs = {
+                    "database_path": database_path,
+                    "matching_options": matching_opts,
+                    "pairing_options": pairing_opts,
+                }
+                _run_match("match_sequential", match_kwargs)
             elif matcher_name == "exhaustive":
-                match_kwargs = {"database_path": database_path}
-                if sift_matching_opts is not None:
-                    match_kwargs["sift_options"] = sift_matching_opts
-                if hasattr(pycolmap, "ExhaustiveMatchingOptions"):
-                    exhaustive_opts = pycolmap.ExhaustiveMatchingOptions()
-                    _try_set_attr(exhaustive_opts, "block_size", exhaustive_block_size)
-                    match_kwargs["matching_options"] = exhaustive_opts
-                if not _run_matcher_with_gpu_fallback(
-                    "match_exhaustive",
-                    match_kwargs,
-                    ("matching_options", "sift_options"),
-                ):
-                    raise RuntimeError("pycolmap.match_exhaustive is unavailable")
+                pairing_opts = pycolmap.ExhaustivePairingOptions()
+                _try_set_attr(pairing_opts, "block_size", exhaustive_block_size)
+                match_kwargs = {
+                    "database_path": database_path,
+                    "matching_options": matching_opts,
+                    "pairing_options": pairing_opts,
+                }
+                _run_match("match_exhaustive", match_kwargs)
 
-            info(
-                "[COLMAP] Matching finished "
-                f"using {'GPU' if matching_gpu_used else 'CPU'}"
-            )
-            del sift_matching_opts
+            info("[COLMAP] Matching finished")
+            del matching_opts
             _trim_process_memory()
 
             # ------------------------------------------------
@@ -880,10 +819,15 @@ class ColmapReconJob:
             has_global_pipeline_options = hasattr(pycolmap, "GlobalPipelineOptions")
             has_global_mapper_options = hasattr(pycolmap, "GlobalMapperOptions")
             has_calibrate_view_graph = hasattr(pycolmap, "calibrate_view_graph")
-            has_view_graph_calibration_options = hasattr(pycolmap, "ViewGraphCalibrationOptions")
+            has_view_graph_calibration_options = hasattr(
+                pycolmap, "ViewGraphCalibrationOptions"
+            )
             info(f"[COLMAP] Running {reconstruction_mode} mapping")
 
-            if reconstruction_mode == "global" and self.params.use_view_graph_calibration:
+            if (
+                reconstruction_mode == "global"
+                and self.params.use_view_graph_calibration
+            ):
                 if has_calibrate_view_graph:
                     info("[COLMAP] Running view graph calibration")
 
@@ -922,8 +866,12 @@ class ColmapReconJob:
                 if has_global_mapper_options:
                     mapper_opts = pycolmap.GlobalMapperOptions()
                     _try_set_attr(mapper_opts, "num_threads", num_threads)
-                    _try_set_attr(mapper_opts, "ba_num_iterations", ba_global_max_num_iterations)
+                    _try_set_attr(
+                        mapper_opts, "ba_num_iterations", ba_global_max_num_iterations
+                    )
                     _try_set_attr(mapper_opts, "skip_bundle_adjustment", False)
+                    # Enable GPU bundle adjustment for global mapping
+                    _try_set_attr(mapper_opts, "ba_use_gpu", True)
                     _try_set_attr(global_opts, "mapper", mapper_opts)
                 reconstructions = pycolmap.global_mapping(
                     database_path=database_path,
@@ -933,11 +881,18 @@ class ColmapReconJob:
                 )
             else:
                 pipeline_opts = pycolmap.IncrementalPipelineOptions()
-                _try_set_attr(pipeline_opts, "ba_global_max_num_iterations", ba_global_max_num_iterations)
+                _try_set_attr(
+                    pipeline_opts,
+                    "ba_global_max_num_iterations",
+                    ba_global_max_num_iterations,
+                )
                 if hasattr(pipeline_opts, "multiple_models"):
                     _try_set_attr(pipeline_opts, "multiple_models", False)
                 if hasattr(pipeline_opts, "max_num_models"):
                     _try_set_attr(pipeline_opts, "max_num_models", 1)
+                # Enable GPU bundle adjustment for incremental mapping
+                _try_set_attr(pipeline_opts, "ba_use_gpu", True)
+                _try_set_attr(pipeline_opts, "ba_gpu_index", self.params.gpu_index)
 
                 reconstructions = pycolmap.incremental_mapping(
                     database_path=database_path,
@@ -1010,10 +965,16 @@ class ColmapReconJob:
                 )
 
             _remove_path(dataset_images_path)
-            shutil.move(os.fspath(temp_publish_root_path / "images"), os.fspath(dataset_images_path))
+            shutil.move(
+                os.fspath(temp_publish_root_path / "images"),
+                os.fspath(dataset_images_path),
+            )
 
             _remove_path(sparse_root_path)
-            shutil.move(os.fspath(temp_publish_root_path / "sparse"), os.fspath(sparse_root_path))
+            shutil.move(
+                os.fspath(temp_publish_root_path / "sparse"),
+                os.fspath(sparse_root_path),
+            )
 
             final_dataset_path = recon_root_path
             final_images_path = dataset_images_path
@@ -1124,8 +1085,12 @@ class MainPanel(lf.ui.Panel):
 
         model.bind("preset", lambda: self._preset_name, self._set_preset)
         model.bind("images_dir", lambda: self.images_dir, self._set_images_dir)
-        model.bind("camera_model", lambda: self.params.camera_model, self._set_camera_model)
-        model.bind("single_camera", lambda: self.params.single_camera, self._set_single_camera)
+        model.bind(
+            "camera_model", lambda: self.params.camera_model, self._set_camera_model
+        )
+        model.bind(
+            "single_camera", lambda: self.params.single_camera, self._set_single_camera
+        )
         model.bind("matcher", lambda: self.params.matcher, self._set_matcher)
         model.bind(
             "reconstruction_mode",
@@ -1164,8 +1129,12 @@ class MainPanel(lf.ui.Panel):
         )
 
         model.bind_func("has_images_dir", lambda: bool(self.images_dir.strip()))
-        model.bind_func("images_dir_text", lambda: self.images_dir or "No folder selected.")
-        model.bind_func("show_exhaustive_block_size", lambda: self.params.matcher == "exhaustive")
+        model.bind_func(
+            "images_dir_text", lambda: self.images_dir or "No folder selected."
+        )
+        model.bind_func(
+            "show_exhaustive_block_size", lambda: self.params.matcher == "exhaustive"
+        )
         model.bind_func("preset_description", self._preset_description)
         model.bind_func("show_logs", self._show_logs)
         model.bind_func("live_log_text", self._live_log_text)
@@ -1185,9 +1154,11 @@ class MainPanel(lf.ui.Panel):
         )
         model.bind_func(
             "result_time",
-            lambda: f"{self._last_result.elapsed_s:.1f}s"
-            if self._last_result and self._last_result.success
-            else "",
+            lambda: (
+                f"{self._last_result.elapsed_s:.1f}s"
+                if self._last_result and self._last_result.success
+                else ""
+            ),
         )
         model.bind_func("result_sparse_points", self._result_sparse_points)
         model.bind_func("result_mean_error", self._result_mean_error)
@@ -1199,9 +1170,11 @@ class MainPanel(lf.ui.Panel):
         )
         model.bind_func(
             "error_text",
-            lambda: self._last_result.error or "Unknown error"
-            if self._last_result and not self._last_result.success
-            else "",
+            lambda: (
+                self._last_result.error or "Unknown error"
+                if self._last_result and not self._last_result.success
+                else ""
+            ),
         )
 
         model.bind_event("browse_images", self._on_browse_images)
@@ -1220,7 +1193,11 @@ class MainPanel(lf.ui.Panel):
         if job_result_key is not None and job_result_key != self._last_result_key:
             self._last_result = job_result
             self._last_result_key = job_result_key
-            if job_result and job_result.success and job_result_key != self._last_loaded_result_key:
+            if (
+                job_result
+                and job_result.success
+                and job_result_key != self._last_loaded_result_key
+            ):
                 self._load_dataset_result(job_result)
                 self._last_loaded_result_key = job_result_key
             self._dirty(
@@ -1260,7 +1237,9 @@ class MainPanel(lf.ui.Panel):
                 self._last_stage = stage
                 self._last_status = status
                 self._last_progress = progress
-                self._dirty("stage_text", "progress_value", "progress_pct", "progress_status")
+                self._dirty(
+                    "stage_text", "progress_value", "progress_pct", "progress_status"
+                )
                 dirty = True
 
         return dirty
@@ -1398,18 +1377,34 @@ class MainPanel(lf.ui.Panel):
 
     def _result_mean_error(self) -> str:
         metrics = self._result_metrics()
-        return _format_metric_px(metrics.mean_reprojection_error_px) if metrics is not None else "N/A"
+        return (
+            _format_metric_px(metrics.mean_reprojection_error_px)
+            if metrics is not None
+            else "N/A"
+        )
 
     def _result_median_error(self) -> str:
         metrics = self._result_metrics()
-        return _format_metric_px(metrics.median_reprojection_error_px) if metrics is not None else "N/A"
+        return (
+            _format_metric_px(metrics.median_reprojection_error_px)
+            if metrics is not None
+            else "N/A"
+        )
 
     def _result_p90_error(self) -> str:
         metrics = self._result_metrics()
-        return _format_metric_px(metrics.p90_reprojection_error_px) if metrics is not None else "N/A"
+        return (
+            _format_metric_px(metrics.p90_reprojection_error_px)
+            if metrics is not None
+            else "N/A"
+        )
 
     def _sync_choice_indices_from_params(self) -> None:
-        self._matcher_idx = self._matchers.index(self.params.matcher) if self.params.matcher in self._matchers else 0
+        self._matcher_idx = (
+            self._matchers.index(self.params.matcher)
+            if self.params.matcher in self._matchers
+            else 0
+        )
         self._camera_model_idx = (
             self._camera_models.index(self.params.camera_model)
             if self.params.camera_model in self._camera_models
@@ -1530,7 +1525,10 @@ class MainPanel(lf.ui.Panel):
 
     def _set_reconstruction_mode(self, value):
         value = str(value or "")
-        if value in ("incremental", "global") and value != self.params.reconstruction_mode:
+        if (
+            value in ("incremental", "global")
+            and value != self.params.reconstruction_mode
+        ):
             self.params.reconstruction_mode = value
             self._set_custom_preset()
             self._dirty("reconstruction_mode")
@@ -1571,7 +1569,9 @@ class MainPanel(lf.ui.Panel):
 
     def _on_browse_images(self, handle, event, args):
         del handle, event, args
-        picked = lf.ui.open_folder_dialog("Select image folder", self.images_dir or os.getcwd())
+        picked = lf.ui.open_folder_dialog(
+            "Select image folder", self.images_dir or os.getcwd()
+        )
         if picked:
             self.images_dir = picked
             self._dirty("images_dir", "images_dir_text", "has_images_dir")
@@ -1608,7 +1608,9 @@ class MainPanel(lf.ui.Panel):
     def _start_job(self):
         images_dir = (self.images_dir or "").strip()
         if not images_dir:
-            self._last_result = ReconResult(success=False, error="Please select an images folder")
+            self._last_result = ReconResult(
+                success=False, error="Please select an images folder"
+            )
             self._last_result_key = self._result_key(self._last_result)
             return
 
