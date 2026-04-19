@@ -14,7 +14,12 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 import lichtfeld as lf
 import pycolmap
@@ -43,23 +48,30 @@ class ReconStage(Enum):
 
 
 SCRUB_FIELD_SPECS = {
-    "sift_max_image_size": ScrubFieldSpec(
-        min_value=800.0,
-        max_value=2400.0,
-        step=100.0,
+    "sift_max_num_features": ScrubFieldSpec(
+        min_value=1024.0,
+        max_value=50000.0,
+        step=1024.0,
+        fmt="%d",
+        data_type=int,
+    ),
+    "sift_max_num_matches": ScrubFieldSpec(
+        min_value=1024.0,
+        max_value=50000.0,
+        step=1024.0,
         fmt="%d",
         data_type=int,
     ),
     "sift_max_num_features": ScrubFieldSpec(
         min_value=1024.0,
-        max_value=4096.0,
+        max_value=10000.0,
         step=512.0,
         fmt="%d",
         data_type=int,
     ),
     "sift_max_num_matches": ScrubFieldSpec(
         min_value=1024.0,
-        max_value=4096.0,
+        max_value=10000.0,
         step=512.0,
         fmt="%d",
         data_type=int,
@@ -83,7 +95,7 @@ SCRUB_FIELD_SPECS = {
 PRESET_LOW_PARAMS = dict(
     camera_model="OPENCV",
     single_camera=True,
-    sift_max_image_size=1200,
+    downsample_multiplier=2,
     sift_max_num_features=1536,
     matcher="sequential",
     reconstruction_mode="incremental",
@@ -96,7 +108,7 @@ PRESET_LOW_PARAMS = dict(
 PRESET_NORMAL_PARAMS = dict(
     camera_model="OPENCV",
     single_camera=True,
-    sift_max_image_size=1600,
+    downsample_multiplier=1,
     sift_max_num_features=2048,
     matcher="exhaustive",
     reconstruction_mode="incremental",
@@ -190,6 +202,84 @@ def _stage_flat_directory(
             continue
         _link_or_copy_file(entry, target_dir / entry.name)
         staged_count += 1
+
+    return staged_count
+
+
+def _stage_and_downsample_directory(
+    source_dir: Path,
+    target_dir: Path,
+    *,
+    downsample_multiplier: int = 1,
+    allowed_extensions: Optional[tuple[str, ...]] = None,
+    warn_callback: Optional[Callable[[str], None]] = None,
+) -> int:
+    """Stage images with downsampling. downsample_multiplier of 1 means no downsampling (1x).
+    2 means 0.5x scale (half resolution), 4 means 0.25x, 8 means 0.125x."""
+    if downsample_multiplier <= 1:
+        # No downsampling needed, use regular staging
+        return _stage_flat_directory(
+            source_dir, target_dir, allowed_extensions=allowed_extensions
+        )
+
+    if _same_path(source_dir, target_dir):
+        return sum(
+            1
+            for entry in source_dir.iterdir()
+            if entry.is_file()
+            and (
+                allowed_extensions is None or entry.suffix.lower() in allowed_extensions
+            )
+        )
+
+    _reset_directory(target_dir)
+
+    if Image is None:
+        raise RuntimeError(
+            "PIL (Pillow) is required for image downsampling but not installed"
+        )
+
+    staged_count = 0
+    scale = 1.0 / downsample_multiplier
+
+    for entry in sorted(source_dir.iterdir(), key=lambda path: path.name.lower()):
+        if not entry.is_file():
+            continue
+        if (
+            allowed_extensions is not None
+            and entry.suffix.lower() not in allowed_extensions
+        ):
+            continue
+
+        target_path = target_dir / entry.name
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with Image.open(entry) as img:
+                # Convert to RGB if necessary (for JPEG output)
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+
+                # Calculate new size
+                new_width = int(img.width * scale)
+                new_height = int(img.height * scale)
+
+                # Ensure minimum size
+                new_width = max(new_width, 1)
+                new_height = max(new_height, 1)
+
+                # Resize using high-quality downsampling
+                resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+                # Save as JPEG with high quality
+                resized.save(target_path, "JPEG", quality=95)
+                staged_count += 1
+        except Exception as e:
+            if warn_callback:
+                warn_callback(f"[COLMAP] Failed to downsample {entry.name}: {e}")
+            # Fall back to copying original
+            _link_or_copy_file(entry, target_path)
+            staged_count += 1
 
     return staged_count
 
@@ -300,7 +390,7 @@ class ColmapParams:
     # Feature extraction
     camera_model: str = "OPENCV"
     single_camera: bool = True
-    sift_max_image_size: int = 1600
+    downsample_multiplier: int = 1  # 1x, 2x, 4x, 8x
     sift_max_num_features: int = 2048
 
     # Matching
@@ -539,7 +629,7 @@ class ColmapReconJob:
             if len(image_files) < 2:
                 raise RuntimeError("Need at least 2 images")
 
-            sift_max_image_size = max(800, int(self.params.sift_max_image_size))
+            downsample_multiplier = max(1, int(self.params.downsample_multiplier))
             sift_max_num_features = max(1024, int(self.params.sift_max_num_features))
             sift_max_num_matches = max(1024, int(self.params.sift_max_num_matches))
             exhaustive_block_size = max(5, int(self.params.exhaustive_block_size))
@@ -555,7 +645,7 @@ class ColmapReconJob:
                 f"matcher={matcher_name}, "
                 f"reconstruction_mode={reconstruction_mode}, "
                 f"cpu_threads={num_threads}, "
-                f"sift_max_image_size={sift_max_image_size}, "
+                f"downsample_multiplier={downsample_multiplier}x, "
                 f"sift_max_num_features={sift_max_num_features}, "
                 f"sift_max_num_matches={sift_max_num_matches}, "
                 f"exhaustive_block_size={exhaustive_block_size}, "
@@ -624,10 +714,12 @@ class ColmapReconJob:
             _reset_directory(work_root_path)
             mapping_root_path.mkdir(parents=True, exist_ok=True)
 
-            staged_image_count = _stage_flat_directory(
+            staged_image_count = _stage_and_downsample_directory(
                 images_path,
                 staged_images_path,
+                downsample_multiplier=downsample_multiplier,
                 allowed_extensions=IMAGE_EXTENSIONS,
+                warn_callback=warn,
             )
 
             if masks_source_path.is_dir():
@@ -696,7 +788,6 @@ class ColmapReconJob:
             # Set SIFT type if available
             if hasattr(pycolmap, "FeatureExtractorType"):
                 extraction_options.type = pycolmap.FeatureExtractorType.SIFT
-            extraction_options.max_image_size = sift_max_image_size
             extraction_options.sift.max_num_features = sift_max_num_features
 
             # Try GPU first, fallback to CPU if needed
@@ -1103,28 +1194,28 @@ class MainPanel(lf.ui.Panel):
             self._set_view_graph_calibration,
         )
         model.bind(
-            "sift_max_image_size",
-            lambda: str(self.params.sift_max_image_size),
-            self._set_sift_max_image_size,
+            "downsample_multiplier",
+            lambda: self.params.downsample_multiplier,
+            self._set_downsample_multiplier,
         )
         model.bind(
             "sift_max_num_features",
-            lambda: str(self.params.sift_max_num_features),
+            lambda: self.params.sift_max_num_features,
             self._set_sift_max_num_features,
         )
         model.bind(
             "sift_max_num_matches",
-            lambda: str(self.params.sift_max_num_matches),
+            lambda: self.params.sift_max_num_matches,
             self._set_sift_max_num_matches,
         )
         model.bind(
             "exhaustive_block_size",
-            lambda: str(self.params.exhaustive_block_size),
+            lambda: self.params.exhaustive_block_size,
             self._set_exhaustive_block_size,
         )
         model.bind(
             "ba_global_max_num_iterations",
-            lambda: str(self.params.ba_global_max_num_iterations),
+            lambda: self.params.ba_global_max_num_iterations,
             self._set_ba_global_max_num_iterations,
         )
 
@@ -1434,7 +1525,7 @@ class MainPanel(lf.ui.Panel):
             "matcher",
             "reconstruction_mode",
             "use_view_graph_calibration",
-            "sift_max_image_size",
+            "downsample_multiplier",
             "sift_max_num_features",
             "sift_max_num_matches",
             "exhaustive_block_size",
@@ -1451,8 +1542,8 @@ class MainPanel(lf.ui.Panel):
         return "Custom is active because one or more advanced settings differ from the presets."
 
     def _get_scrub_field_value(self, prop: str) -> float:
-        if prop == "sift_max_image_size":
-            return float(self.params.sift_max_image_size)
+        if prop == "downsample_multiplier":
+            return float(self.params.downsample_multiplier)
         if prop == "sift_max_num_features":
             return float(self.params.sift_max_num_features)
         if prop == "sift_max_num_matches":
@@ -1464,8 +1555,8 @@ class MainPanel(lf.ui.Panel):
         raise KeyError(prop)
 
     def _set_scrub_field_value(self, prop: str, value: float) -> None:
-        if prop == "sift_max_image_size":
-            self._set_sift_max_image_size(value)
+        if prop == "downsample_multiplier":
+            self._set_downsample_multiplier(value)
             return
         if prop == "sift_max_num_features":
             self._set_sift_max_num_features(value)
@@ -1540,14 +1631,14 @@ class MainPanel(lf.ui.Panel):
             self._set_custom_preset()
             self._dirty("use_view_graph_calibration")
 
-    def _set_sift_max_image_size(self, value):
-        self._set_int_param("sift_max_image_size", value, 800, 2400)
+    def _set_downsample_multiplier(self, value):
+        self._set_int_param("downsample_multiplier", value, 1, 8)
 
     def _set_sift_max_num_features(self, value):
-        self._set_int_param("sift_max_num_features", value, 1024, 4096)
+        self._set_int_param("sift_max_num_features", value, 1024, 10000)
 
     def _set_sift_max_num_matches(self, value):
-        self._set_int_param("sift_max_num_matches", value, 1024, 4096)
+        self._set_int_param("sift_max_num_matches", value, 1024, 10000)
 
     def _set_exhaustive_block_size(self, value):
         self._set_int_param("exhaustive_block_size", value, 5, 50)

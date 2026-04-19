@@ -87,12 +87,6 @@
       </div>
 
       <div class="setting-row">
-        <span class="prop-label">Max Image Size</span>
-        <input type="range" class="setting-slider" data-value="sift_max_image_size" min="800" max="2400" step="100" />
-        <span class="slider-value">{{sift_max_image_size}}</span>
-      </div>
-
-      <div class="setting-row">
         <span class="prop-label">Max Features</span>
         <input type="range" class="setting-slider" data-value="sift_max_num_features" min="1024" max="4096" step="256" />
         <span class="slider-value">{{sift_max_num_features}}</span>
@@ -114,6 +108,15 @@
         <span class="prop-label">BA Max Iterations</span>
         <input type="range" class="setting-slider" data-value="ba_global_max_num_iterations" min="10" max="100" step="5" />
         <span class="slider-value">{{ba_global_max_num_iterations}}</span>
+      </div>
+      <div class="setting-row">
+        <span class="prop-label">Downsample</span>
+        <select data-value="downsample_multiplier">
+          <option value="1">1x </option>
+          <option value="2">2x </option>
+          <option value="4">4x </option>
+          <option value="8">8x </option>
+        </select>
       </div>
     </div>
   </div>
