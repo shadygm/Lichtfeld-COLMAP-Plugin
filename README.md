@@ -53,6 +53,11 @@ Images are pre-resized using high-quality Lanczos resampling before feature extr
 - **Incremental**: Default and generally the safest option.
 - **Global (GLOMAP)**: Available when supported by the installed `pycolmap` build.
 
+### Matching Modes
+
+- **Exhaustive**: Matches all image pairs. This is the default and is usually best for small to medium image folders.
+- **Sequential**: Matches neighboring filenames for video-like image sequences. Use sequentially ordered names such as `image0001.jpg`, `image0002.jpg`, etc.
+
 ### Reported Metrics
 
 - **Mean Reprojection Error**

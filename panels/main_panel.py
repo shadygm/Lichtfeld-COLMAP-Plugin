@@ -50,20 +50,6 @@ class ReconStage(Enum):
 SCRUB_FIELD_SPECS = {
     "sift_max_num_features": ScrubFieldSpec(
         min_value=1024.0,
-        max_value=50000.0,
-        step=1024.0,
-        fmt="%d",
-        data_type=int,
-    ),
-    "sift_max_num_matches": ScrubFieldSpec(
-        min_value=1024.0,
-        max_value=50000.0,
-        step=1024.0,
-        fmt="%d",
-        data_type=int,
-    ),
-    "sift_max_num_features": ScrubFieldSpec(
-        min_value=1024.0,
         max_value=10000.0,
         step=512.0,
         fmt="%d",
@@ -129,20 +115,6 @@ def _try_set_attr(obj, attr: str, value) -> bool:
         return True
     except Exception:
         return False
-
-
-def _get_existing_file_attr(obj, attr: str) -> Path | None:
-    try:
-        value = getattr(obj, attr)
-    except Exception:
-        return None
-    if value is None:
-        return None
-
-    path = Path(os.fspath(value))
-    if not os.fspath(path):
-        return None
-    return path if path.is_file() else None
 
 
 def _trim_process_memory() -> None:
@@ -408,7 +380,7 @@ class ColmapParams:
     sift_max_num_features: int = 2048
 
     # Matching
-    matcher: str = "exhaustive"  # exhaustive | sequential | vocab_tree
+    matcher: str = "exhaustive"  # exhaustive | sequential
     reconstruction_mode: str = "incremental"  # incremental | global
     use_view_graph_calibration: bool = False
     sift_max_num_matches: int = 2048
@@ -653,6 +625,11 @@ class ColmapReconJob:
             matcher_name = self.params.matcher
             reconstruction_mode = self.params.reconstruction_mode
             num_threads = min(8, os.cpu_count() or 4)
+            if matcher_name not in ("exhaustive", "sequential"):
+                warn(
+                    f"[COLMAP] Unknown matcher '{matcher_name}', using exhaustive matching."
+                )
+                matcher_name = "exhaustive"
 
             info(
                 "[COLMAP] Reconstruction settings: "
@@ -865,42 +842,9 @@ class ColmapReconJob:
                     else:
                         raise
 
-            if matcher_name == "vocab_tree":
-                if hasattr(pycolmap, "match_vocab_tree"):
-                    try:
-                        pairing_opts = pycolmap.VocabTreePairingOptions()
-                        _try_set_attr(pairing_opts, "num_images", 100)
-                        _try_set_attr(pairing_opts, "num_nearest_neighbors", 5)
-                        if _get_existing_file_attr(pairing_opts, "vocab_tree_path"):
-                            match_kwargs = {
-                                "database_path": database_path,
-                                "matching_options": matching_opts,
-                                "pairing_options": pairing_opts,
-                            }
-                            _run_match("match_vocab_tree", match_kwargs)
-                        else:
-                            warn(
-                                "[COLMAP] Vocab tree matching requires a valid "
-                                "vocab_tree_path; falling back to sequential matching."
-                            )
-                            matcher_name = "sequential"
-                    except Exception as exc:
-                        warn(
-                            "[COLMAP] Vocab tree matching unavailable or failed "
-                            f"({exc}); falling back to sequential matching."
-                        )
-                        matcher_name = "sequential"
-                else:
-                    warn(
-                        "[COLMAP] pycolmap.match_vocab_tree is unavailable; "
-                        "falling back to sequential matching."
-                    )
-                    matcher_name = "sequential"
-
             if matcher_name == "sequential":
                 pairing_opts = pycolmap.SequentialPairingOptions()
-                if _get_existing_file_attr(pairing_opts, "vocab_tree_path"):
-                    _try_set_attr(pairing_opts, "loop_detection", True)
+                _try_set_attr(pairing_opts, "loop_detection", False)
                 match_kwargs = {
                     "database_path": database_path,
                     "matching_options": matching_opts,
@@ -1173,7 +1117,7 @@ class MainPanel(lf.ui.Panel):
 
         self._preset_options = ["Low", "Normal", "Custom"]
         self._preset_name = "Normal"
-        self._matchers = ["exhaustive", "sequential", "vocab_tree"]
+        self._matchers = ["exhaustive", "sequential"]
         self._camera_models = ["OPENCV", "PINHOLE", "SIMPLE_RADIAL", "SIMPLE_PINHOLE"]
         self._apply_preset("Normal")
 

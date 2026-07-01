@@ -70,12 +70,11 @@
       </div>
 
 
-      <div class="setting-row" title="Vocab tree requires pycolmap support and a configured vocabulary tree file.">
+      <div class="setting-row" title="Exhaustive matches every pair. Sequential matches neighboring filenames; use sequentially ordered names such as image0001.jpg.">
         <span class="prop-label">Matcher</span>
         <select data-value="matcher">
           <option value="exhaustive">Exhaustive</option>
           <option value="sequential">Sequential</option>
-          <option value="vocab_tree">Vocab Tree</option>
         </select>
       </div>
 
