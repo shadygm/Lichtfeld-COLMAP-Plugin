@@ -131,6 +131,20 @@ def _try_set_attr(obj, attr: str, value) -> bool:
         return False
 
 
+def _get_existing_file_attr(obj, attr: str) -> Path | None:
+    try:
+        value = getattr(obj, attr)
+    except Exception:
+        return None
+    if value is None:
+        return None
+
+    path = Path(os.fspath(value))
+    if not os.fspath(path):
+        return None
+    return path if path.is_file() else None
+
+
 def _trim_process_memory() -> None:
     gc.collect()
     try:
@@ -857,12 +871,19 @@ class ColmapReconJob:
                         pairing_opts = pycolmap.VocabTreePairingOptions()
                         _try_set_attr(pairing_opts, "num_images", 100)
                         _try_set_attr(pairing_opts, "num_nearest_neighbors", 5)
-                        match_kwargs = {
-                            "database_path": database_path,
-                            "matching_options": matching_opts,
-                            "pairing_options": pairing_opts,
-                        }
-                        _run_match("match_vocab_tree", match_kwargs)
+                        if _get_existing_file_attr(pairing_opts, "vocab_tree_path"):
+                            match_kwargs = {
+                                "database_path": database_path,
+                                "matching_options": matching_opts,
+                                "pairing_options": pairing_opts,
+                            }
+                            _run_match("match_vocab_tree", match_kwargs)
+                        else:
+                            warn(
+                                "[COLMAP] Vocab tree matching requires a valid "
+                                "vocab_tree_path; falling back to sequential matching."
+                            )
+                            matcher_name = "sequential"
                     except Exception as exc:
                         warn(
                             "[COLMAP] Vocab tree matching unavailable or failed "
@@ -878,7 +899,8 @@ class ColmapReconJob:
 
             if matcher_name == "sequential":
                 pairing_opts = pycolmap.SequentialPairingOptions()
-                _try_set_attr(pairing_opts, "loop_detection", True)
+                if _get_existing_file_attr(pairing_opts, "vocab_tree_path"):
+                    _try_set_attr(pairing_opts, "loop_detection", True)
                 match_kwargs = {
                     "database_path": database_path,
                     "matching_options": matching_opts,

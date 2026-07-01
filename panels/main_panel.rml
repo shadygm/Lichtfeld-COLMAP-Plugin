@@ -70,7 +70,7 @@
       </div>
 
 
-      <div class="setting-row" title="Vocab tree is the preferred low-memory option.">
+      <div class="setting-row" title="Vocab tree requires pycolmap support and a configured vocabulary tree file.">
         <span class="prop-label">Matcher</span>
         <select data-value="matcher">
           <option value="exhaustive">Exhaustive</option>
